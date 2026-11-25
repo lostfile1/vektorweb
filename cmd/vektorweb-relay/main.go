@@ -2,72 +2,181 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"math"
 	"mime"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/gorilla/websocket"
 	"vektorweb/internal/identity"
 )
 
+const (
+	ProtocolVersion    = 1
+	MaxWireFrameBytes  = 512 * 1024
+	MaxVoiceFrameBytes = 32 * 1024
+	MaxAssetChunkChars = 128 * 1024
+	MaxPropsPerClient  = 32
+	MaxTotalProps      = 512
+	PingInterval       = 25 * time.Second
+	PongWait           = 60 * time.Second
+	WriteWait          = 5 * time.Second
+	OutboundQueueSize  = 128
+)
+
 type WireMsg struct {
-	Type       string    `json:"type"`
-	Nonce      string    `json:"nonce,omitempty"`
-	Timestamp  int64     `json:"timestamp,omitempty"`
-	PubKey     string    `json:"pubkey,omitempty"`
-	TargetPub  string    `json:"target_pub,omitempty"`
-	Signature  string    `json:"signature,omitempty"`
-	AvatarHash string    `json:"avatar_hash,omitempty"`
-	Nick       string    `json:"nick,omitempty"`
-	Pos        []float32 `json:"pos,omitempty"`
-	Yaw        float32   `json:"yaw,omitempty"`
-	Hash       string    `json:"hash,omitempty"`
-	Seq        int       `json:"seq,omitempty"`
-	Total      int       `json:"total,omitempty"`
-	Data       string    `json:"data,omitempty"`
-	Text       string    `json:"text,omitempty"`
-	Channel    string    `json:"channel,omitempty"`
-	PropID     string    `json:"prop_id,omitempty"`
-	Scale      float32   `json:"scale,omitempty"`
+	Type         string    `json:"type"`
+	ProtoVersion int       `json:"proto_version,omitempty"`
+	Capabilities []string  `json:"capabilities,omitempty"`
+	Nonce        string    `json:"nonce,omitempty"`
+	Timestamp    int64     `json:"timestamp,omitempty"`
+	PubKey       string    `json:"pubkey,omitempty"`
+	TargetPub    string    `json:"target_pub,omitempty"`
+	Signature    string    `json:"signature,omitempty"`
+	AvatarHash   string    `json:"avatar_hash,omitempty"`
+	Nick         string    `json:"nick,omitempty"`
+	Pos          []float32 `json:"pos,omitempty"`
+	Yaw          float32   `json:"yaw,omitempty"`
+	Hash         string    `json:"hash,omitempty"`
+	Seq          int       `json:"seq,omitempty"`
+	Total        int       `json:"total,omitempty"`
+	Data         string    `json:"data,omitempty"`
+	Text         string    `json:"text,omitempty"`
+	Channel      string    `json:"channel,omitempty"`
+	PropID       string    `json:"prop_id,omitempty"`
+	Scale        float32   `json:"scale,omitempty"`
+	Code         string    `json:"code,omitempty"`
+	Message      string    `json:"message,omitempty"`
+}
+
+type WorldConfigTOML struct {
+	World struct {
+		Title string    `toml:"title"`
+		Spawn []float32 `toml:"spawn"`
+	} `toml:"world"`
+	Rules struct {
+		Admins []string `toml:"admins"`
+	} `toml:"rules"`
+}
+
+type StatusResponse struct {
+	ProtoVersion  int    `json:"proto_version"`
+	Title         string `json:"title"`
+	Domain        string `json:"domain"`
+	PlacementMode string `json:"placement_mode"`
+	Online        int    `json:"online"`
+	Props         int    `json:"props"`
+	UptimeSec     int64  `json:"uptime_sec"`
+}
+
+type outboundFrame struct {
+	msgType int
+	data    []byte
+	dropOK  bool
 }
 
 type ClientConn struct {
-	conn       *websocket.Conn
-	writeMu    sync.Mutex
-	pubKey     string
-	nick       string
-	avatarHash string
-	pos        [3]float32
+	conn         *websocket.Conn
+	send         chan outboundFrame
+	closeOnce    sync.Once
+	pubKey       string
+	nick         string
+	avatarHash   string
+	capabilities []string
+	pos          [3]float32
+	yaw          float32
+	hasState     bool
+	lastStateAt  time.Time
+	lastChatAt   time.Time
 }
 
-func (c *ClientConn) sendJSON(v any) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	_ = c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	return c.conn.WriteJSON(v)
+func newClientConn(conn *websocket.Conn) *ClientConn {
+	return &ClientConn{
+		conn: conn,
+		send: make(chan outboundFrame, OutboundQueueSize),
+	}
 }
 
-func (c *ClientConn) sendBinary(payload []byte) error {
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	_ = c.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
-	return c.conn.WriteMessage(websocket.BinaryMessage, payload)
+func (c *ClientConn) close() {
+	c.closeOnce.Do(func() {
+		close(c.send)
+		_ = c.conn.Close()
+	})
+}
+
+func (c *ClientConn) enqueueJSON(v any, dropOK bool) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return
+	}
+	c.enqueueRaw(websocket.TextMessage, b, dropOK)
+}
+
+func (c *ClientConn) enqueueRaw(msgType int, payload []byte, dropOK bool) {
+	defer func() { _ = recover() }()
+	frame := outboundFrame{msgType: msgType, data: payload, dropOK: dropOK}
+	if dropOK {
+		select {
+		case c.send <- frame:
+		default:
+		}
+		return
+	}
+	select {
+	case c.send <- frame:
+	case <-time.After(250 * time.Millisecond):
+		go c.close()
+	}
+}
+
+func (c *ClientConn) writePump() {
+	ticker := time.NewTicker(PingInterval)
+	defer func() {
+		ticker.Stop()
+		c.close()
+	}()
+
+	for {
+		select {
+		case frame, ok := <-c.send:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(WriteWait))
+			if !ok {
+				_ = c.conn.WriteMessage(websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseNormalClosure, "bye"))
+				return
+			}
+			if err := c.conn.WriteMessage(frame.msgType, frame.data); err != nil {
+				return
+			}
+		case <-ticker.C:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(WriteWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
+		}
+	}
 }
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	Subprotocols: []string{"vektorweb.v1"},
+	CheckOrigin:  func(r *http.Request) bool { return true },
 }
 
 type RelayServer struct {
@@ -75,11 +184,22 @@ type RelayServer struct {
 	worldDir      string
 	serveHTTP     bool
 	placementMode string
-	mu            sync.RWMutex
-	bannedKeys    map[string]bool
-	blockedItems  map[string]bool
-	clients       map[string]*ClientConn
-	props         map[string]WireMsg
+	trustProxy    bool
+	startedAt     time.Time
+
+	mu              sync.RWMutex
+	worldTitle      string
+	worldSpawn      []float32
+	adminKeys       map[string]bool
+	cliAdmins       map[string]bool
+	bannedKeys      map[string]bool
+	blockedItems    map[string]bool
+	bansModTime     time.Time
+	blockedModTime  time.Time
+	tomlModTime     time.Time
+	clients         map[string]*ClientConn
+	props           map[string]WireMsg
+	ipConns         map[string]int
 }
 
 func main() {
@@ -88,7 +208,15 @@ func main() {
 	worldDir := flag.String("dir", "./world", "World folder to auto-create and serve")
 	serveHTTP := flag.Bool("http", true, "Serve world files over HTTP on the same port (disable if using Apache/Nginx)")
 	placement := flag.String("placement", "ephemeral", "Prop placement mode: forbid | ephemeral | persistent")
+	trustProxy := flag.Bool("trust-proxy", false, "Trust X-Real-IP / X-Forwarded-For headers from a local reverse proxy (Nginx/Caddy)")
+	adminFlag := flag.String("admin", "", "Comma-separated 64-char hex Ed25519 admin public keys (in addition to world.toml rules.admins)")
 	flag.Parse()
+
+	switch *placement {
+	case "forbid", "ephemeral", "persistent":
+	default:
+		log.Fatalf("invalid -placement %q (expected forbid, ephemeral, or persistent)", *placement)
+	}
 
 	resolvedDomain := strings.TrimSpace(*domain)
 	if resolvedDomain == "" {
@@ -111,22 +239,49 @@ func main() {
 		log.Fatalf("failed initializing world folder %s: %v", *worldDir, err)
 	}
 
+	cliAdmins := make(map[string]bool)
+	for _, k := range strings.Split(*adminFlag, ",") {
+		k = strings.ToLower(strings.TrimSpace(k))
+		if isValidHex64(k) {
+			cliAdmins[k] = true
+		}
+	}
+
 	srv := &RelayServer{
 		domain:        resolvedDomain,
 		worldDir:      *worldDir,
 		serveHTTP:     *serveHTTP,
 		placementMode: *placement,
-		bannedKeys:    loadFlatSet(filepath.Join(*worldDir, "bans.txt")),
-		blockedItems:  loadFlatSet(filepath.Join(*worldDir, "blocked_items.txt")),
+		trustProxy:    *trustProxy,
+		startedAt:     time.Now(),
+		worldTitle:    "VektorWeb World",
+		worldSpawn:    []float32{0.0, 2.0, 10.0},
+		adminKeys:     make(map[string]bool),
+		cliAdmins:     cliAdmins,
+		bannedKeys:    make(map[string]bool),
+		blockedItems:  make(map[string]bool),
 		clients:       make(map[string]*ClientConn),
 		props:         make(map[string]WireMsg),
+		ipConns:       make(map[string]int),
 	}
+
+	srv.reloadConfigFiles(true)
 
 	if *placement == "persistent" {
 		srv.loadPersistentProps()
 	}
 
-	http.HandleFunc("/", srv.handleRoot)
+	go srv.watchLoop()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", srv.handleRoot)
+
+	httpSrv := &http.Server{
+		Addr:              *addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
 
 	displayHost := resolvedDomain
 	port := "7777"
@@ -134,12 +289,143 @@ func main() {
 		port = (*addr)[idx+1:]
 	}
 
-	log.Printf("vektorweb-relay listening on %s (domain=%s, placement=%s)", *addr, resolvedDomain, *placement)
+	log.Printf("vektorweb-relay v%d listening on %s (domain=%s, placement=%s, trust_proxy=%v)",
+		ProtocolVersion, *addr, resolvedDomain, *placement, *trustProxy)
 	log.Printf("World folder : %s", *worldDir)
 	if *serveHTTP {
 		log.Printf("Join URL     : http://%s:%s/world.toml", displayHost, port)
+		log.Printf("Status URL   : http://%s:%s/status.json", displayHost, port)
 	}
-	log.Fatal(http.ListenAndServe(*addr, nil))
+
+	stop := make(chan os.Signal, 1)
+	reloadSig := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
+	signal.Notify(reloadSig, syscall.SIGUSR1)
+
+	go func() {
+		for range reloadSig {
+			log.Printf("Received SIGUSR1 — reloading bans.txt, blocked_items.txt, and world.toml")
+			srv.reloadConfigFiles(true)
+		}
+	}()
+
+	go func() {
+		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+
+	<-stop
+	log.Printf("Shutting down vektorweb-relay...")
+
+	// Hard watchdog so open WebSockets or keep-alive HTTP requests can never keep the process alive
+	go func() {
+		time.Sleep(2 * time.Second)
+		log.Printf("Force-exiting vektorweb-relay.")
+		os.Exit(0)
+	}()
+
+	srv.shutdown()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	_ = httpSrv.Shutdown(ctx)
+	_ = httpSrv.Close()
+	log.Printf("Shutdown complete.")
+	os.Exit(0)
+}
+
+func (s *RelayServer) watchLoop() {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.reloadConfigFiles(false)
+	}
+}
+
+func fileModTime(path string) time.Time {
+	if st, err := os.Stat(path); err == nil {
+		return st.ModTime()
+	}
+	return time.Time{}
+}
+
+func (s *RelayServer) reloadConfigFiles(force bool) {
+	bansPath := filepath.Join(s.worldDir, "bans.txt")
+	blockedPath := filepath.Join(s.worldDir, "blocked_items.txt")
+	tomlPath := filepath.Join(s.worldDir, "world.toml")
+
+	bMod := fileModTime(bansPath)
+	iMod := fileModTime(blockedPath)
+	tMod := fileModTime(tomlPath)
+
+	s.mu.Lock()
+	var toKick []*ClientConn
+
+	if force || !bMod.Equal(s.bansModTime) {
+		s.bansModTime = bMod
+		s.bannedKeys = loadFlatSet(bansPath)
+		for pub, cc := range s.clients {
+			if s.bannedKeys[strings.ToLower(pub)] || s.bannedKeys[pub] {
+				toKick = append(toKick, cc)
+			}
+		}
+	}
+
+	if force || !iMod.Equal(s.blockedModTime) {
+		s.blockedModTime = iMod
+		s.blockedItems = loadFlatSet(blockedPath)
+	}
+
+	if force || !tMod.Equal(s.tomlModTime) {
+		s.tomlModTime = tMod
+		var wc WorldConfigTOML
+		if raw, err := os.ReadFile(tomlPath); err == nil {
+			if _, err := toml.Decode(string(raw), &wc); err == nil {
+				if strings.TrimSpace(wc.World.Title) != "" {
+					s.worldTitle = strings.TrimSpace(wc.World.Title)
+				}
+				if finiteVec3(wc.World.Spawn) {
+					s.worldSpawn = append([]float32(nil), wc.World.Spawn...)
+				}
+				admins := make(map[string]bool, len(s.cliAdmins)+len(wc.Rules.Admins))
+				for k := range s.cliAdmins {
+					admins[k] = true
+				}
+				for _, k := range wc.Rules.Admins {
+					k = strings.ToLower(strings.TrimSpace(k))
+					if isValidHex64(k) {
+						admins[k] = true
+					}
+				}
+				s.adminKeys = admins
+			}
+		}
+	}
+	s.mu.Unlock()
+
+	for _, cc := range toKick {
+		s.sendError(cc, "ERR_BANNED", "public key was banned on this relay")
+		go func(target *ClientConn) {
+			time.Sleep(50 * time.Millisecond)
+			target.close()
+		}(cc)
+	}
+}
+
+func (s *RelayServer) shutdown() {
+	s.mu.Lock()
+	s.savePersistentPropsLocked()
+	peers := make([]*ClientConn, 0, len(s.clients))
+	for _, c := range s.clients {
+		peers = append(peers, c)
+	}
+	s.clients = make(map[string]*ClientConn)
+	s.mu.Unlock()
+
+	for _, p := range peers {
+		p.close()
+	}
 }
 
 func ensureWorldDir(dir, addr, domain string) error {
@@ -201,6 +487,7 @@ script_sha256 = ""
 placement_mode = "ephemeral"
 max_avatar_mb = 15
 max_item_mb = 5
+admins = []
 `, domain, port)
 		if err := os.WriteFile(tomlPath, []byte(starterToml), 0644); err != nil {
 			return err
@@ -281,13 +568,45 @@ func buildPlazaGLB(w, h, d float32) []byte {
 	return out
 }
 
+func (s *RelayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.mu.RLock()
+	resp := StatusResponse{
+		ProtoVersion:  ProtocolVersion,
+		Title:         s.worldTitle,
+		Domain:        s.domain,
+		PlacementMode: s.placementMode,
+		Online:        len(s.clients),
+		Props:         len(s.props),
+		UptimeSec:     int64(time.Since(s.startedAt).Seconds()),
+	}
+	s.mu.RUnlock()
+
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
 func (s *RelayServer) handleRoot(w http.ResponseWriter, r *http.Request) {
 	if websocket.IsWebSocketUpgrade(r) {
 		s.handleWS(w, r)
 		return
 	}
+	if r.URL.Path == "/status.json" {
+		s.handleStatus(w, r)
+		return
+	}
 	if !s.serveHTTP {
 		http.Error(w, "vektorweb-relay WebSocket endpoint", http.StatusUpgradeRequired)
+		return
+	}
+
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -318,7 +637,7 @@ func (s *RelayServer) loadPersistentProps() {
 	var list []WireMsg
 	if err := json.Unmarshal(b, &list); err == nil {
 		for _, pr := range list {
-			if pr.PropID != "" && !s.blockedItems[pr.Hash] {
+			if pr.PropID != "" && !s.blockedItems[strings.ToLower(pr.Hash)] && !s.blockedItems[pr.Hash] {
 				s.props[pr.PropID] = pr
 			}
 		}
@@ -334,27 +653,183 @@ func (s *RelayServer) savePersistentPropsLocked() {
 	for _, pr := range s.props {
 		list = append(list, pr)
 	}
-	if b, err := json.MarshalIndent(list, "", "  "); err == nil {
-		_ = os.WriteFile(s.persistentPropsPath(), b, 0644)
+	b, err := json.MarshalIndent(list, "", "  ")
+	if err != nil {
+		return
+	}
+	tmpPath := s.persistentPropsPath() + ".tmp"
+	if err := os.WriteFile(tmpPath, b, 0644); err == nil {
+		_ = os.Rename(tmpPath, s.persistentPropsPath())
 	}
 }
 
+func (s *RelayServer) updateWorldSpawnLocked(pos []float32) error {
+	if !finiteVec3(pos) {
+		return errors.New("invalid spawn coordinates")
+	}
+	s.worldSpawn = []float32{pos[0], pos[1], pos[2]}
+	tomlPath := filepath.Join(s.worldDir, "world.toml")
+	raw, err := os.ReadFile(tomlPath)
+	if err != nil {
+		return err
+	}
+	spawnLine := fmt.Sprintf("spawn = [%.2f, %.2f, %.2f]", pos[0], pos[1], pos[2])
+	lines := strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n")
+	replaced := false
+	inWorld := false
+	worldEndIdx := -1
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			if inWorld && worldEndIdx == -1 {
+				worldEndIdx = i
+			}
+			inWorld = (trimmed == "[world]")
+			continue
+		}
+		if inWorld && strings.HasPrefix(trimmed, "spawn") {
+			rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "spawn"))
+			if strings.HasPrefix(rest, "=") {
+				lines[i] = spawnLine
+				replaced = true
+				break
+			}
+		}
+	}
+	if !replaced {
+		if worldEndIdx > 0 {
+			newLines := make([]string, 0, len(lines)+1)
+			newLines = append(newLines, lines[:worldEndIdx]...)
+			newLines = append(newLines, spawnLine)
+			newLines = append(newLines, lines[worldEndIdx:]...)
+			lines = newLines
+		} else if inWorld {
+			lines = append(lines, spawnLine)
+		} else {
+			lines = append(lines, "", "[world]", spawnLine)
+		}
+	}
+	tmpPath := tomlPath + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(strings.Join(lines, "\n")), 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, tomlPath); err != nil {
+		return err
+	}
+	s.tomlModTime = fileModTime(tomlPath)
+	return nil
+}
+
+func (s *RelayServer) appendBanKeyLocked(pubKey string) {
+	pubKey = strings.ToLower(strings.TrimSpace(pubKey))
+	if !isValidHex64(pubKey) || s.bannedKeys[pubKey] {
+		return
+	}
+	s.bannedKeys[pubKey] = true
+	bansPath := filepath.Join(s.worldDir, "bans.txt")
+	f, err := os.OpenFile(bansPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err == nil {
+		_, _ = fmt.Fprintf(f, "%s # banned via admin command at %s\n", pubKey, time.Now().UTC().Format(time.RFC3339))
+		_ = f.Close()
+		s.bansModTime = fileModTime(bansPath)
+	}
+}
+
+func (s *RelayServer) clientIP(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	if s.trustProxy {
+		if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
+			if ip := net.ParseIP(xri); ip != nil {
+				return ip.String()
+			}
+		}
+		if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
+			first := strings.TrimSpace(strings.Split(xff, ",")[0])
+			if ip := net.ParseIP(first); ip != nil {
+				return ip.String()
+			}
+		}
+	}
+	return host
+}
+
+func isValidHex64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func finiteVec3(p []float32) bool {
+	if len(p) != 3 {
+		return false
+	}
+	for _, v := range p {
+		if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *RelayServer) sendError(cc *ClientConn, code, message string) {
+	cc.enqueueJSON(WireMsg{
+		Type:    "ERROR",
+		Code:    code,
+		Message: message,
+	}, false)
+}
+
 func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
+	ip := s.clientIP(r)
+	s.mu.Lock()
+	if s.ipConns[ip] >= 16 {
+		s.mu.Unlock()
+		http.Error(w, "too many connections from IP", http.StatusTooManyRequests)
+		return
+	}
+	s.ipConns[ip]++
+	s.mu.Unlock()
+
+	defer func() {
+		s.mu.Lock()
+		s.ipConns[ip]--
+		if s.ipConns[ip] <= 0 {
+			delete(s.ipConns, ip)
+		}
+		s.mu.Unlock()
+	}()
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
-	defer conn.Close()
+	cc := newClientConn(conn)
+	defer cc.close()
 
-	conn.SetReadLimit(512 * 1024)
+	conn.SetReadLimit(MaxWireFrameBytes)
 
 	nonceBytes := make([]byte, 32)
 	_, _ = rand.Read(nonceBytes)
 	nonce := hex.EncodeToString(nonceBytes)
 	ts := time.Now().Unix()
 
-	cc := &ClientConn{conn: conn}
-	if err := cc.sendJSON(WireMsg{Type: "CHALLENGE", Nonce: nonce, Timestamp: ts}); err != nil {
+	_ = conn.SetWriteDeadline(time.Now().Add(WriteWait))
+	if err := conn.WriteJSON(WireMsg{
+		Type:         "CHALLENGE",
+		ProtoVersion: ProtocolVersion,
+		Nonce:        nonce,
+		Timestamp:    ts,
+	}); err != nil {
 		return
 	}
 
@@ -364,32 +839,74 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !identity.VerifyChallenge(auth.PubKey, nonce, ts, s.domain, auth.Signature) {
-		log.Printf("Rejected invalid Ed25519 signature from %s", r.RemoteAddr)
+	if auth.ProtoVersion != 0 && auth.ProtoVersion != ProtocolVersion {
+		_ = conn.SetWriteDeadline(time.Now().Add(WriteWait))
+		_ = conn.WriteJSON(WireMsg{
+			Type:         "ERROR",
+			ProtoVersion: ProtocolVersion,
+			Code:         "ERR_PROTO_MISMATCH",
+			Message:      fmt.Sprintf("unsupported proto_version %d (relay supports v%d)", auth.ProtoVersion, ProtocolVersion),
+		})
 		return
 	}
 
+	if !identity.VerifyChallenge(auth.PubKey, nonce, ts, s.domain, auth.Signature) {
+		log.Printf("Rejected invalid Ed25519 signature from %s", ip)
+		_ = conn.SetWriteDeadline(time.Now().Add(WriteWait))
+		_ = conn.WriteJSON(WireMsg{
+			Type:    "ERROR",
+			Code:    "ERR_AUTH_FAILED",
+			Message: "invalid Ed25519 challenge signature",
+		})
+		return
+	}
+
+	pubLower := strings.ToLower(auth.PubKey)
+	avLower := strings.ToLower(auth.AvatarHash)
+
 	s.mu.RLock()
-	banned := s.bannedKeys[auth.PubKey]
-	blockedAvatar := auth.AvatarHash != "" && s.blockedItems[auth.AvatarHash]
+	banned := s.bannedKeys[pubLower] || s.bannedKeys[auth.PubKey]
+	blockedAvatar := avLower != "" && avLower != "none" && (s.blockedItems[avLower] || s.blockedItems[auth.AvatarHash])
+	isAdmin := s.adminKeys[pubLower]
 	s.mu.RUnlock()
 
 	if banned {
 		log.Printf("Blocked banned pubkey %s", auth.PubKey[:12])
+		_ = conn.SetWriteDeadline(time.Now().Add(WriteWait))
+		_ = conn.WriteJSON(WireMsg{
+			Type:    "ERROR",
+			Code:    "ERR_BANNED",
+			Message: "public key is banned on this relay",
+		})
 		return
 	}
 	if blockedAvatar {
 		log.Printf("Rejected blocked avatar %s from %s", auth.AvatarHash[:12], auth.PubKey[:12])
+		_ = conn.SetWriteDeadline(time.Now().Add(WriteWait))
+		_ = conn.WriteJSON(WireMsg{
+			Type:    "ERROR",
+			Code:    "ERR_BLOCKED_AVATAR",
+			Message: "avatar hash is blocked on this relay",
+		})
 		return
 	}
 
 	cc.pubKey = auth.PubKey
 	cc.avatarHash = auth.AvatarHash
 	cc.nick = sanitizeNick(auth.Nick, auth.PubKey)
+	cc.capabilities = sanitizeCaps(auth.Capabilities)
+
+	go cc.writePump()
+
+	_ = conn.SetReadDeadline(time.Now().Add(PongWait))
+	conn.SetPongHandler(func(string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(PongWait))
+		return nil
+	})
 
 	s.mu.Lock()
 	if old, exists := s.clients[auth.PubKey]; exists {
-		_ = old.conn.Close()
+		old.close()
 	}
 	s.clients[auth.PubKey] = cc
 	total := len(s.clients)
@@ -397,12 +914,59 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 	for _, pr := range s.props {
 		existingProps = append(existingProps, pr)
 	}
+	existingPeers := make([]WireMsg, 0, len(s.clients))
+	for pub, peer := range s.clients {
+		if pub == auth.PubKey || !peer.hasState {
+			continue
+		}
+		existingPeers = append(existingPeers, WireMsg{
+			Type:       "STATE",
+			PubKey:     peer.pubKey,
+			Nick:       peer.nick,
+			AvatarHash: peer.avatarHash,
+			Pos:        []float32{peer.pos[0], peer.pos[1], peer.pos[2]},
+			Yaw:        peer.yaw,
+		})
+	}
 	s.mu.Unlock()
+
+	cc.enqueueJSON(WireMsg{
+		Type:         "WELCOME",
+		ProtoVersion: ProtocolVersion,
+		PubKey:       auth.PubKey,
+		Nick:         cc.nick,
+		Channel:      s.placementMode,
+	}, false)
+
+	s.mu.RLock()
+	curSpawn := append([]float32(nil), s.worldSpawn...)
+	s.mu.RUnlock()
+	if finiteVec3(curSpawn) {
+		cc.enqueueJSON(WireMsg{
+			Type: "SPAWN_UPDATE",
+			Pos:  curSpawn,
+		}, false)
+	}
+
+	if isAdmin {
+		cc.enqueueJSON(WireMsg{
+			Type:      "CHAT",
+			PubKey:    auth.PubKey,
+			Nick:      "RELAY",
+			Channel:   "whisper",
+			Text:      "Admin authenticated (/setspawn [x y z], /kick, /ban, /clearprops)",
+			Timestamp: time.Now().Unix(),
+		}, false)
+	}
 
 	log.Printf("Player joined: %s (%s) [total: %d]", cc.nick, auth.PubKey[:12], total)
 
+	// Replay active world props and currently connected peers' last known poses
 	for _, pr := range existingProps {
-		_ = cc.sendJSON(pr)
+		cc.enqueueJSON(pr, false)
+	}
+	for _, st := range existingPeers {
+		cc.enqueueJSON(st, false)
 	}
 
 	defer func() {
@@ -421,22 +985,22 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.Unlock()
 
-		s.broadcast(auth.PubKey, WireMsg{Type: "LEAVE", PubKey: auth.PubKey})
+		s.broadcast(auth.PubKey, WireMsg{Type: "LEAVE", PubKey: auth.PubKey}, false)
 		for _, id := range removed {
-			s.broadcast(auth.PubKey, WireMsg{Type: "PROP_REMOVE", PropID: id})
+			s.broadcast(auth.PubKey, WireMsg{Type: "PROP_REMOVE", PropID: id}, false)
 		}
 		log.Printf("Player left: %s (%s)", cc.nick, auth.PubKey[:12])
 	}()
 
-	_ = conn.SetReadDeadline(time.Time{})
 	for {
 		msgType, raw, err := conn.ReadMessage()
 		if err != nil {
 			break
 		}
+		_ = conn.SetReadDeadline(time.Now().Add(PongWait))
 
 		if msgType == websocket.BinaryMessage {
-			if len(raw) > 1 && raw[0] == 0x02 && len(raw) <= 32*1024 {
+			if len(raw) > 1 && raw[0] == 0x02 && len(raw) <= MaxVoiceFrameBytes {
 				pubBytes, err := hex.DecodeString(auth.PubKey)
 				if err == nil && len(pubBytes) == 32 {
 					packet := make([]byte, 1+32+len(raw)-1)
@@ -451,86 +1015,309 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 
 		var msg WireMsg
 		if err := json.Unmarshal(raw, &msg); err != nil {
+			s.sendError(cc, "ERR_BAD_JSON", "malformed JSON frame")
 			continue
 		}
 		msg.PubKey = auth.PubKey
 
 		switch msg.Type {
 		case "STATE":
+			now := time.Now()
+			if !cc.lastStateAt.IsZero() && now.Sub(cc.lastStateAt) < 12*time.Millisecond {
+				continue
+			}
+			cc.lastStateAt = now
+
+			if len(msg.Pos) > 0 && !finiteVec3(msg.Pos) {
+				s.sendError(cc, "ERR_INVALID_POS", "position must be 3 finite floats")
+				continue
+			}
+			if math.IsNaN(float64(msg.Yaw)) || math.IsInf(float64(msg.Yaw), 0) {
+				msg.Yaw = 0
+			}
+
 			s.mu.Lock()
 			if len(msg.Pos) == 3 {
 				cc.pos = [3]float32{msg.Pos[0], msg.Pos[1], msg.Pos[2]}
+				cc.hasState = true
 			}
+			cc.yaw = msg.Yaw
 			if msg.Nick != "" {
 				cc.nick = sanitizeNick(msg.Nick, auth.PubKey)
+			}
+			if msg.AvatarHash != "" {
+				cc.avatarHash = msg.AvatarHash
 			}
 			msg.Nick = cc.nick
 			s.mu.Unlock()
 
-			if msg.AvatarHash != "" && s.isItemBlocked(msg.AvatarHash) {
+			if msg.AvatarHash != "" && msg.AvatarHash != "none" && s.isItemBlocked(msg.AvatarHash) {
 				msg.AvatarHash = "none"
 			}
-			s.broadcast(auth.PubKey, msg)
+			s.broadcast(auth.PubKey, msg, true)
 
 		case "REQ_ASSET":
-			if msg.Hash == "" || s.isItemBlocked(msg.Hash) {
+			if !isValidHex64(msg.Hash) {
+				s.sendError(cc, "ERR_INVALID_HASH", "asset hash must be 64-char hex SHA-256")
 				continue
 			}
-			s.sendTo(msg.TargetPub, msg)
-
-		case "ASSET_CHUNK":
-			if msg.Hash == "" || s.isItemBlocked(msg.Hash) || len(msg.Data) > 128*1024 {
+			if s.isItemBlocked(msg.Hash) {
+				s.sendError(cc, "ERR_BLOCKED_ITEM", "requested asset hash is blocked")
 				continue
 			}
 			if msg.TargetPub != "" {
-				s.sendTo(msg.TargetPub, msg)
-			} else {
-				s.broadcast(auth.PubKey, msg)
+				s.sendTo(msg.TargetPub, msg, false)
 			}
 
-		case "PROP_SPAWN":
-			if s.placementMode == "forbid" || msg.Hash == "" || msg.PropID == "" || len(msg.Pos) != 3 {
+		case "ASSET_CHUNK":
+			if !isValidHex64(msg.Hash) || len(msg.Data) > MaxAssetChunkChars {
+				s.sendError(cc, "ERR_INVALID_CHUNK", "invalid asset chunk hash or size")
 				continue
 			}
 			if s.isItemBlocked(msg.Hash) {
 				continue
 			}
+			if msg.TargetPub != "" {
+				s.sendTo(msg.TargetPub, msg, false)
+			} else {
+				s.broadcast(auth.PubKey, msg, false)
+			}
+
+		case "PROP_SPAWN":
+			if s.placementMode == "forbid" {
+				s.sendError(cc, "ERR_PLACEMENT_FORBIDDEN", "prop placement is disabled on this world")
+				continue
+			}
+			if !isValidHex64(msg.Hash) || msg.PropID == "" || len(msg.PropID) > 64 || !finiteVec3(msg.Pos) {
+				s.sendError(cc, "ERR_INVALID_PROP", "prop requires valid prop_id, 64-char sha256 hash, and 3D pos")
+				continue
+			}
+			if math.IsNaN(float64(msg.Scale)) || math.IsInf(float64(msg.Scale), 0) || msg.Scale <= 0 {
+				msg.Scale = 1.0
+			}
+			if msg.Scale > 25.0 {
+				msg.Scale = 25.0
+			}
+
 			s.mu.Lock()
+			if s.blockedItems[strings.ToLower(msg.Hash)] || s.blockedItems[msg.Hash] {
+				s.mu.Unlock()
+				s.sendError(cc, "ERR_BLOCKED_ITEM", "prop asset hash is blocked on this relay")
+				continue
+			}
+			if existing, exists := s.props[msg.PropID]; exists && existing.PubKey != auth.PubKey {
+				s.mu.Unlock()
+				s.sendError(cc, "ERR_PROP_OWNERSHIP", "prop_id belongs to another peer")
+				continue
+			}
+			owned := 0
+			for _, pr := range s.props {
+				if pr.PubKey == auth.PubKey && pr.PropID != msg.PropID {
+					owned++
+				}
+			}
+			if owned >= MaxPropsPerClient || len(s.props) >= MaxTotalProps {
+				s.mu.Unlock()
+				s.sendError(cc, "ERR_PROP_LIMIT", "prop limit reached")
+				continue
+			}
 			s.props[msg.PropID] = msg
 			s.savePersistentPropsLocked()
 			s.mu.Unlock()
-			s.broadcast(auth.PubKey, msg)
+
+			s.broadcast(auth.PubKey, msg, false)
 
 		case "PROP_REMOVE":
+			if msg.PropID == "" {
+				continue
+			}
 			s.mu.Lock()
 			pr, ok := s.props[msg.PropID]
-			if ok && pr.PubKey == auth.PubKey {
+			allowDelete := ok && (pr.PubKey == auth.PubKey || s.adminKeys[pubLower])
+			if allowDelete {
 				delete(s.props, msg.PropID)
 				s.savePersistentPropsLocked()
 				s.mu.Unlock()
-				s.broadcast(auth.PubKey, msg)
+				s.broadcast("", msg, false)
 			} else {
 				s.mu.Unlock()
+				s.sendError(cc, "ERR_PROP_OWNERSHIP", "prop not found or owned by another peer")
 			}
 
 		case "CHAT":
+			now := time.Now()
+			if !cc.lastChatAt.IsZero() && now.Sub(cc.lastChatAt) < 250*time.Millisecond {
+				s.sendError(cc, "ERR_RATE_LIMIT", "chat rate limit exceeded")
+				continue
+			}
+			cc.lastChatAt = now
+
 			txt := strings.TrimSpace(msg.Text)
 			if txt == "" || len(txt) > 512 {
 				continue
 			}
+
+			// Handle admin slash commands (/setspawn, /kick, /ban, /clearprops) if sender is in admins list
+			if txt == "/setspawn" || strings.HasPrefix(txt, "/setspawn ") ||
+				strings.HasPrefix(txt, "/kick ") || strings.HasPrefix(txt, "/ban ") || txt == "/clearprops" {
+				s.handleAdminCommand(cc, txt)
+				continue
+			}
+
 			msg.Text = txt
 			msg.Nick = cc.nick
-			msg.Timestamp = time.Now().Unix()
+			msg.Timestamp = now.Unix()
 
 			if msg.Channel == "proximity" {
 				s.broadcastProximity(cc, msg, 35.0)
 			} else if msg.Channel == "whisper" && msg.TargetPub != "" {
-				s.sendTo(msg.TargetPub, msg)
+				s.sendTo(msg.TargetPub, msg, false)
 			} else {
 				msg.Channel = "global"
-				s.broadcast(auth.PubKey, msg)
+				s.broadcast(auth.PubKey, msg, false)
 			}
+
+		default:
+			s.sendError(cc, "ERR_UNKNOWN_TYPE", fmt.Sprintf("unknown message type %q", msg.Type))
 		}
+	}
+}
+
+func (s *RelayServer) handleAdminCommand(cc *ClientConn, cmd string) {
+	pubLower := strings.ToLower(cc.pubKey)
+	s.mu.RLock()
+	isAdmin := s.adminKeys[pubLower]
+	s.mu.RUnlock()
+
+	if !isAdmin {
+		s.sendError(cc, "ERR_FORBIDDEN", "admin privileges required")
+		return
+	}
+
+	if cmd == "/setspawn" || strings.HasPrefix(cmd, "/setspawn ") {
+		var newPos []float32
+		if cmd == "/setspawn" {
+			s.mu.RLock()
+			if !cc.hasState {
+				s.mu.RUnlock()
+				s.sendError(cc, "ERR_NO_POS", "move slightly first or pass /setspawn <x> <y> <z>")
+				return
+			}
+			newPos = []float32{cc.pos[0], cc.pos[1], cc.pos[2]}
+			s.mu.RUnlock()
+		} else {
+			var x, y, z float32
+			if _, err := fmt.Sscanf(strings.TrimPrefix(cmd, "/setspawn "), "%f %f %f", &x, &y, &z); err != nil {
+				s.sendError(cc, "ERR_INVALID_POS", "usage: /setspawn or /setspawn <x> <y> <z>")
+				return
+			}
+			newPos = []float32{x, y, z}
+		}
+		if !finiteVec3(newPos) || math.Abs(float64(newPos[0])) > 10000 || math.Abs(float64(newPos[1])) > 10000 || math.Abs(float64(newPos[2])) > 10000 {
+			s.sendError(cc, "ERR_INVALID_POS", "spawn coordinates out of valid range")
+			return
+		}
+
+		s.mu.Lock()
+		err := s.updateWorldSpawnLocked(newPos)
+		s.mu.Unlock()
+		if err != nil {
+			s.sendError(cc, "ERR_SPAWN_SAVE", "failed saving spawn to world.toml: "+err.Error())
+			return
+		}
+
+		s.broadcast("", WireMsg{Type: "SPAWN_UPDATE", Pos: newPos}, false)
+		cc.enqueueJSON(WireMsg{
+			Type:      "CHAT",
+			PubKey:    cc.pubKey,
+			Nick:      "RELAY",
+			Channel:   "whisper",
+			Text:      fmt.Sprintf("Updated world spawn to [%.2f, %.2f, %.2f] in world.toml.", newPos[0], newPos[1], newPos[2]),
+			Timestamp: time.Now().Unix(),
+		}, false)
+		return
+	}
+
+	if cmd == "/clearprops" {
+		s.mu.Lock()
+		ids := make([]string, 0, len(s.props))
+		for id := range s.props {
+			ids = append(ids, id)
+		}
+		s.props = make(map[string]WireMsg)
+		s.savePersistentPropsLocked()
+		s.mu.Unlock()
+
+		for _, id := range ids {
+			s.broadcast("", WireMsg{Type: "PROP_REMOVE", PropID: id}, false)
+		}
+		cc.enqueueJSON(WireMsg{
+			Type:      "CHAT",
+			PubKey:    cc.pubKey,
+			Nick:      "RELAY",
+			Channel:   "whisper",
+			Text:      fmt.Sprintf("Cleared %d props from world.", len(ids)),
+			Timestamp: time.Now().Unix(),
+		}, false)
+		return
+	}
+
+	isBan := strings.HasPrefix(cmd, "/ban ")
+	query := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(cmd, "/ban "), "/kick "))
+	if query == "" {
+		return
+	}
+	qLower := strings.ToLower(query)
+
+	s.mu.Lock()
+	var target *ClientConn
+	for pub, peer := range s.clients {
+		if pub == cc.pubKey {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(pub), qLower) || strings.EqualFold(peer.nick, query) {
+			target = peer
+			break
+		}
+	}
+	if isBan && target != nil {
+		s.appendBanKeyLocked(target.pubKey)
+	} else if isBan && isValidHex64(qLower) {
+		s.appendBanKeyLocked(qLower)
+	}
+	s.mu.Unlock()
+
+	if target != nil {
+		action := "kicked"
+		code := "ERR_KICKED"
+		if isBan {
+			action = "banned"
+			code = "ERR_BANNED"
+		}
+		s.sendError(target, code, "you were "+action+" by a world admin")
+		go func(t *ClientConn) {
+			time.Sleep(50 * time.Millisecond)
+			t.close()
+		}(target)
+		cc.enqueueJSON(WireMsg{
+			Type:      "CHAT",
+			PubKey:    cc.pubKey,
+			Nick:      "RELAY",
+			Channel:   "whisper",
+			Text:      fmt.Sprintf("Admin %s %s (%s...).", action, target.nick, target.pubKey[:12]),
+			Timestamp: time.Now().Unix(),
+		}, false)
+	} else if isBan && isValidHex64(qLower) {
+		cc.enqueueJSON(WireMsg{
+			Type:      "CHAT",
+			PubKey:    cc.pubKey,
+			Nick:      "RELAY",
+			Channel:   "whisper",
+			Text:      fmt.Sprintf("Added offline pubkey %s... to bans.txt.", qLower[:12]),
+			Timestamp: time.Now().Unix(),
+		}, false)
+	} else {
+		s.sendError(cc, "ERR_NOT_FOUND", "no matching online peer for "+query)
 	}
 }
 
@@ -546,6 +1333,23 @@ func sanitizeNick(raw, pub string) string {
 		n = n[:24]
 	}
 	return n
+}
+
+func sanitizeCaps(caps []string) []string {
+	if len(caps) == 0 {
+		return nil
+	}
+	if len(caps) > 16 {
+		caps = caps[:16]
+	}
+	out := make([]string, 0, len(caps))
+	for _, c := range caps {
+		c = strings.TrimSpace(c)
+		if c != "" && len(c) <= 32 {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 func (s *RelayServer) relayVoice(sender *ClientConn, packet []byte) {
@@ -566,7 +1370,7 @@ func (s *RelayServer) relayVoice(sender *ClientConn, packet []byte) {
 	s.mu.RUnlock()
 
 	for _, t := range targets {
-		_ = t.sendBinary(packet)
+		t.enqueueRaw(websocket.BinaryMessage, packet, true)
 	}
 }
 
@@ -588,17 +1392,17 @@ func (s *RelayServer) broadcastProximity(sender *ClientConn, msg WireMsg, radius
 	s.mu.RUnlock()
 
 	for _, t := range targets {
-		_ = t.sendJSON(msg)
+		t.enqueueJSON(msg, false)
 	}
 }
 
 func (s *RelayServer) isItemBlocked(hash string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.blockedItems[hash]
+	return s.blockedItems[strings.ToLower(hash)] || s.blockedItems[hash]
 }
 
-func (s *RelayServer) broadcast(senderPub string, msg WireMsg) {
+func (s *RelayServer) broadcast(senderPub string, msg WireMsg, dropOK bool) {
 	s.mu.RLock()
 	peers := make([]*ClientConn, 0, len(s.clients))
 	for pub, c := range s.clients {
@@ -609,16 +1413,16 @@ func (s *RelayServer) broadcast(senderPub string, msg WireMsg) {
 	s.mu.RUnlock()
 
 	for _, p := range peers {
-		_ = p.sendJSON(msg)
+		p.enqueueJSON(msg, dropOK)
 	}
 }
 
-func (s *RelayServer) sendTo(targetPub string, msg WireMsg) {
+func (s *RelayServer) sendTo(targetPub string, msg WireMsg, dropOK bool) {
 	s.mu.RLock()
 	target := s.clients[targetPub]
 	s.mu.RUnlock()
 	if target != nil {
-		_ = target.sendJSON(msg)
+		target.enqueueJSON(msg, dropOK)
 	}
 }
 
@@ -637,7 +1441,7 @@ func loadFlatSet(path string) map[string]bool {
 			continue
 		}
 		fields := strings.Fields(line)
-		set[fields[0]] = true
+		set[strings.ToLower(fields[0])] = true
 	}
 	return set
 }

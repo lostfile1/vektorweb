@@ -1,16 +1,23 @@
 [world]
-title = "Starter VektorWeb Plaza"
+title = "VektorWeb Nexus Plaza"
 author_pubkey = ""
 relay_url = "ws://127.0.0.1:7777/"
-spawn = [0.0, 2.0, 10.0]
+spawn = [0.0, 2.0, 15.0]
 
 [assets]
 environment = "environment.glb"
-environment_sha256 = ""
+environment_sha256 = "728abb6407dad39eaa44c136aef407b4b9cac9f30d30816204aef82c4eda89fa"
 script = "world.lua"
-script_sha256 = ""
+script_sha256 = "c84640f77d8f4a29f0faa4def4bf316ceeae341b07f0b3dbfb5990e99d654c56"
 
 [rules]
 placement_mode = "ephemeral"
 max_avatar_mb = 15
 max_item_mb = 5
+admins = []
+
+[[portals]]
+name = "Local Offline Sandbox"
+url = "local://sandbox"
+pos = [0.0, 0.1, -16.0]
+radius = 1.8

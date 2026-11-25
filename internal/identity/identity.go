@@ -5,15 +5,122 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
 type Keypair struct {
 	Priv ed25519.PrivateKey
 	Pub  ed25519.PublicKey
+}
+
+// AssetLicense is a creator-signed Ed25519 ownership certificate saved alongside
+// a .glb asset (<hash>.license.json) to bind an asset hash to a specific buyer/owner
+// and control whether the buyer is permitted to transfer/resell it to another peer.
+type AssetLicense struct {
+	AssetHash    string `json:"asset_hash"`
+	CreatorPub   string `json:"creator_pub"`
+	OwnerPub     string `json:"owner_pub"`
+	Transferable bool   `json:"transferable"`
+	IssuedAt     int64  `json:"issued_at"`
+	Nonce        string `json:"nonce"`
+	Signature    string `json:"signature"`
+}
+
+func (l *AssetLicense) CanonicalPayload() string {
+	t := "false"
+	if l.Transferable {
+		t = "true"
+	}
+	return fmt.Sprintf(
+		"VEKTORWEB_LICENSE_V1\n%s\n%s\n%s\n%s\n%d\n%s",
+		strings.ToLower(strings.TrimSpace(l.AssetHash)),
+		strings.ToLower(strings.TrimSpace(l.CreatorPub)),
+		strings.ToLower(strings.TrimSpace(l.OwnerPub)),
+		t,
+		l.IssuedAt,
+		strings.TrimSpace(l.Nonce),
+	)
+}
+
+func (l *AssetLicense) Verify(expectedHash, expectedOwner string) error {
+	if l == nil {
+		return errors.New("missing license")
+	}
+	if len(l.AssetHash) != 64 || len(l.CreatorPub) != 64 || len(l.OwnerPub) != 64 {
+		return errors.New("invalid license hash or pubkey length")
+	}
+	if expectedHash != "" && !strings.EqualFold(l.AssetHash, expectedHash) {
+		return errors.New("license asset_hash does not match .glb hash")
+	}
+	if expectedOwner != "" && !strings.EqualFold(l.OwnerPub, expectedOwner) {
+		return errors.New("license owner_pub does not match your pubkey")
+	}
+	if len(l.Nonce) == 0 || len(l.Nonce) > 64 {
+		return errors.New("invalid license nonce")
+	}
+	pubRaw, err := hex.DecodeString(l.CreatorPub)
+	if err != nil || len(pubRaw) != ed25519.PublicKeySize {
+		return errors.New("invalid creator_pub hex")
+	}
+	sigRaw, err := hex.DecodeString(l.Signature)
+	if err != nil || len(sigRaw) != ed25519.SignatureSize {
+		return errors.New("invalid signature hex")
+	}
+	if !ed25519.Verify(ed25519.PublicKey(pubRaw), []byte(l.CanonicalPayload()), sigRaw) {
+		return errors.New("invalid Ed25519 signature on AssetLicense")
+	}
+	return nil
+}
+
+// MintAssetLicense creates and signs an AssetLicense binding assetHash to ownerPub.
+// If transferable is false, the recipient cannot transfer or re-issue the asset.
+func (k *Keypair) MintAssetLicense(assetHash, ownerPub string, transferable bool) (*AssetLicense, error) {
+	assetHash = strings.ToLower(strings.TrimSpace(assetHash))
+	ownerPub = strings.ToLower(strings.TrimSpace(ownerPub))
+	if len(assetHash) != 64 || len(ownerPub) != 64 {
+		return nil, errors.New("assetHash and ownerPub must be 64-char hex")
+	}
+	nonceBytes := make([]byte, 16)
+	if _, err := rand.Read(nonceBytes); err != nil {
+		return nil, err
+	}
+	lic := &AssetLicense{
+		AssetHash:    assetHash,
+		CreatorPub:   strings.ToLower(k.PubHex()),
+		OwnerPub:     ownerPub,
+		Transferable: transferable,
+		IssuedAt:     time.Now().Unix(),
+		Nonce:        hex.EncodeToString(nonceBytes),
+	}
+	sig := ed25519.Sign(k.Priv, []byte(lic.CanonicalPayload()))
+	lic.Signature = hex.EncodeToString(sig)
+	return lic, nil
+}
+
+func SaveAssetLicense(path string, lic *AssetLicense) error {
+	b, err := json.MarshalIndent(lic, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0644)
+}
+
+func LoadAssetLicense(path string) (*AssetLicense, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var lic AssetLicense
+	if err := json.Unmarshal(b, &lic); err != nil {
+		return nil, err
+	}
+	return &lic, nil
 }
 
 func LoadOrCreate(baseDir string) (*Keypair, error) {
