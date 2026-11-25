@@ -1,0 +1,1 @@
+# Add blocked .glb SHA-256 hashes (one 64-char hex hash per line)

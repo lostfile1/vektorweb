@@ -1,0 +1,16 @@
+[world]
+title = "Starter VektorWeb Plaza"
+author_pubkey = ""
+relay_url = "ws://127.0.0.1:7777/"
+spawn = [0.0, 2.0, 10.0]
+
+[assets]
+environment = "environment.glb"
+environment_sha256 = ""
+script = "world.lua"
+script_sha256 = ""
+
+[rules]
+placement_mode = "ephemeral"
+max_avatar_mb = 15
+max_item_mb = 5

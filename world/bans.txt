@@ -1,0 +1,1 @@
+# Add banned Ed25519 public keys (one 64-char hex key per line)
