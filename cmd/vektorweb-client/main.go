@@ -2692,31 +2692,13 @@ func main() {
 		}
 		netState.mu.RUnlock()
 
-		hudW := int32(680)
-		if sw-260 < hudW {
-			hudW = sw - 260
-		}
-		if hudW < 340 {
-			hudW = 340
-		}
-		hudH := int32(68)
-		if luaHUD != "" {
-			hudH += 24
-		}
-		if ghostActive && activeProp.Name != "" {
-			hudH += 24
-		}
-		rl.DrawRectangle(12, 12, hudW, hudH, rl.NewColor(14, 18, 28, 195))
-		rl.DrawRectangleLines(12, 12, hudW, hudH, rl.NewColor(55, 75, 105, 200))
-
 		connDot := rl.Red
 		connLabel := "OFFLINE"
 		if isConn {
 			connDot = rl.Lime
 			connLabel = "ONLINE (" + rHost + ")"
 		}
-		rl.DrawCircle(26, 26, 5, connDot)
-		rl.DrawText(fmt.Sprintf("%s  |  %s  |  %s (%s...)", connLabel, activeWorld.Manifest.World.Title, curNick, kp.PubHex()[:8]), 38, 18, 17, rl.RayWhite)
+		headerLine := fmt.Sprintf("%s  |  %s  |  %s", connLabel, activeWorld.Manifest.World.Title, formatPeerTag(curNick, kp.PubHex()))
 
 		modeBadge := "WALK"
 		if !walkMode {
@@ -2724,20 +2706,68 @@ func main() {
 		} else if thirdPerson {
 			modeBadge = "WALK 3P"
 		}
-		rl.DrawText(fmt.Sprintf("FPS: %d  |  Mode: %s  |  Peers: %d  |  Props: %d", rl.GetFPS(), modeBadge, peerCount, propCount), 22, 44, 16, rl.LightGray)
+		statsLine := fmt.Sprintf("FPS: %d  |  Mode: %s  |  Peers: %d  |  Props: %d", rl.GetFPS(), modeBadge, peerCount, propCount)
 
-		nextHudY := int32(68)
-		if luaHUD != "" {
-			rl.DrawText(luaHUD, 22, nextHudY, 16, rl.Gold)
-			nextHudY += 24
-		}
+		buildLine := ""
 		if ghostActive && activeProp.Name != "" {
 			snapTxt := "OFF"
 			if snapToGrid {
 				snapTxt = "ON"
 			}
-			rl.DrawText(fmt.Sprintf("[BUILD: %s] Snap[B]:%s | Yaw:%.0f | Y:%.2f | Scale:%.2fx | [F4] Spawn | [G/Esc] Exit", activeProp.Name, snapTxt, ghostYawOffset, ghostYOffset, ghostScale), 22, nextHudY, 15, rl.Lime)
+			buildLine = fmt.Sprintf("[BUILD: %s] Snap[B]:%s | Yaw:%.0f | Y:%.2f | Scale:%.2fx | [F4] Spawn | [G/Esc] Exit", activeProp.Name, snapTxt, ghostYawOffset, ghostYOffset, ghostScale)
 		}
+
+		// Auto-size HUD width to fit content cleanly while reserving space for top-right status/radar
+		desiredW := rl.MeasureText(headerLine, 17) + 42
+		if w2 := rl.MeasureText(statsLine, 16) + 24; w2 > desiredW {
+			desiredW = w2
+		}
+		if luaHUD != "" {
+			if w3 := rl.MeasureText(luaHUD, 16) + 24; w3 > desiredW {
+				desiredW = w3
+			}
+		}
+		if buildLine != "" {
+			if w4 := rl.MeasureText(buildLine, 15) + 24; w4 > desiredW {
+				desiredW = w4
+			}
+		}
+		maxHudW := sw - 295
+		if maxHudW < 340 {
+			maxHudW = 340
+		}
+		hudW := desiredW
+		if hudW < 420 {
+			hudW = 420
+		}
+		if hudW > maxHudW {
+			hudW = maxHudW
+		}
+
+		hudH := int32(68)
+		if luaHUD != "" {
+			hudH += 24
+		}
+		if buildLine != "" {
+			hudH += 24
+		}
+		rl.DrawRectangle(12, 12, hudW, hudH, rl.NewColor(14, 18, 28, 195))
+		rl.DrawRectangleLines(12, 12, hudW, hudH, rl.NewColor(55, 75, 105, 200))
+
+		rl.BeginScissorMode(14, 14, hudW-4, hudH-4)
+		rl.DrawCircle(26, 26, 5, connDot)
+		rl.DrawText(truncateToWidth(headerLine, 17, hudW-38), 38, 18, 17, rl.RayWhite)
+		rl.DrawText(truncateToWidth(statsLine, 16, hudW-22), 22, 44, 16, rl.LightGray)
+
+		nextHudY := int32(68)
+		if luaHUD != "" {
+			rl.DrawText(truncateToWidth(luaHUD, 16, hudW-22), 22, nextHudY, 16, rl.Gold)
+			nextHudY += 24
+		}
+		if buildLine != "" {
+			rl.DrawText(truncateToWidth(buildLine, 15, hudW-22), 22, nextHudY, 15, rl.Lime)
+		}
+		rl.EndScissorMode()
 
 		if rl.IsKeyDown(rl.KeyV) && !chatActive {
 			rl.DrawRectangle(sw-260, 12, 246, 28, rl.NewColor(20, 45, 25, 215))
@@ -3189,6 +3219,20 @@ func wrapChatLine(text string, fontSize, maxWidth int32) []string {
 		out = append(out, cur)
 	}
 	return out
+}
+
+func truncateToWidth(text string, fontSize, maxWidth int32) string {
+	if text == "" || maxWidth <= 24 || rl.MeasureText(text, fontSize) <= maxWidth {
+		return text
+	}
+	runes := []rune(text)
+	for i := len(runes) - 1; i >= 1; i-- {
+		cand := string(runes[:i]) + "..."
+		if rl.MeasureText(cand, fontSize) <= maxWidth {
+			return cand
+		}
+	}
+	return "..."
 }
 
 func fitInputTail(prefix, input, suffix string, fontSize, maxWidth int32) string {
