@@ -336,12 +336,12 @@ func (n *NetState) addChatColor(line string, col rl.Color) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.chatLog = append(n.chatLog, ChatEntry{
-		Text:      sanitizeDisplayText(line, 180),
+		Text:      sanitizeDisplayText(line, 320),
 		Color:     col,
 		Timestamp: time.Now(),
 	})
-	if len(n.chatLog) > 12 {
-		n.chatLog = n.chatLog[len(n.chatLog)-12:]
+	if len(n.chatLog) > 24 {
+		n.chatLog = n.chatLog[len(n.chatLog)-24:]
 	}
 }
 
@@ -437,6 +437,25 @@ func finiteVec3(p []float32) bool {
 		}
 	}
 	return true
+}
+
+func formatPeerTag(nick, pubKey string) string {
+	cleanNick := sanitizeDisplayText(strings.TrimSpace(nick), 24)
+	pubLower := strings.ToLower(strings.TrimSpace(pubKey))
+	shortPub := pubLower
+	if len(shortPub) > 6 {
+		shortPub = shortPub[:6]
+	}
+	if cleanNick == "" {
+		if len(pubLower) >= 8 {
+			return pubLower[:8]
+		}
+		return shortPub
+	}
+	if shortPub == "" || (len(pubLower) >= 8 && strings.EqualFold(cleanNick, pubLower[:8])) {
+		return cleanNick
+	}
+	return fmt.Sprintf("%s#%s", cleanNick, shortPub)
 }
 
 func lerpAngleDeg(a, b, t float32) float32 {
@@ -1869,7 +1888,7 @@ func main() {
 					lookedAt = &RayTarget{
 						Kind:     "peer",
 						ID:       peer.PubKey,
-						Label:    sanitizeDisplayText(peer.Nick, 24),
+						Label:    formatPeerTag(peer.Nick, peer.PubKey),
 						SubLabel: "[E] Offer Trade/Item",
 						Box:      box,
 					}
@@ -2061,7 +2080,7 @@ func main() {
 							if transferAllowResale {
 								modeStr = "RESELLABLE"
 							}
-							netState.addChat(fmt.Sprintf("[TRANSFER]: Sent %s license offer for %s to %s", modeStr, chosen.Name, recipient.Nick))
+							netState.addChat(fmt.Sprintf("[TRANSFER]: Sent %s license offer for %s to %s", modeStr, chosen.Name, formatPeerTag(recipient.Nick, recipient.PubKey)))
 							transferModalOpen = false
 						}
 					}
@@ -2540,7 +2559,7 @@ func main() {
 					sp := rl.GetWorldToScreen(tagWorld, cam)
 					screenLabels = append(screenLabels, screenLabel{
 						screenPos: sp,
-						label:     sanitizeDisplayText(peer.Nick, 24),
+						label:     formatPeerTag(peer.Nick, peer.PubKey),
 						speaking:  speaking,
 					})
 				}
@@ -2709,35 +2728,96 @@ func main() {
 			}
 		}
 
-		chatBoxW := int32(660)
-		if sw-40 < chatBoxW {
-			chatBoxW = sw - 40
+		chatBoxW := int32(640)
+		if sw-32 < chatBoxW {
+			chatBoxW = sw - 32
 		}
-		visibleCount := len(lines)
-		if visibleCount > 8 {
-			visibleCount = 8
+		if chatBoxW < 280 {
+			chatBoxW = 280
 		}
-		if visibleCount > 0 || chatActive {
-			panelH := int32(visibleCount*21 + 14)
-			if panelH < 32 {
-				panelH = 32
+		const (
+			chatX        = int32(12)
+			chatFontSize = int32(16)
+			chatLineH    = int32(20)
+			chatPadX     = int32(10)
+			chatPadY     = int32(8)
+			maxVisLines  = 9
+		)
+		innerTextW := chatBoxW - chatPadX*2
+
+		var wrappedLines []renderedChatLine
+		for _, entry := range lines {
+			for _, seg := range wrapChatLine(entry.Text, chatFontSize, innerTextW) {
+				wrappedLines = append(wrappedLines, renderedChatLine{
+					text:  seg,
+					color: entry.Color,
+				})
 			}
+		}
+		if len(wrappedLines) > maxVisLines {
+			wrappedLines = wrappedLines[len(wrappedLines)-maxVisLines:]
+		}
+
+		if len(wrappedLines) > 0 || chatActive {
+			headerH := int32(0)
+			if chatActive {
+				headerH = 22
+			}
+			bodyH := int32(len(wrappedLines))*chatLineH + chatPadY*2
+			if bodyH < 34 {
+				bodyH = 34
+			}
+			panelH := headerH + bodyH
 			panelY := sh - 46 - panelH
-			rl.DrawRectangle(12, panelY, chatBoxW, panelH, rl.NewColor(12, 16, 24, 175))
-			startIdx := len(lines) - visibleCount
-			cy := panelY + 7
-			for i := startIdx; i < len(lines); i++ {
-				rl.DrawText(lines[i].Text, 20, cy, 16, lines[i].Color)
-				cy += 21
+
+			bgAlpha := uint8(190)
+			borderCol := rl.NewColor(55, 75, 105, 190)
+			if chatActive {
+				bgAlpha = 228
+				borderCol = rl.NewColor(80, 175, 130, 230)
 			}
+			rl.DrawRectangle(chatX, panelY, chatBoxW, panelH, rl.NewColor(11, 15, 23, bgAlpha))
+			rl.DrawRectangleLines(chatX, panelY, chatBoxW, panelH, borderCol)
+			// Subtle left accent bar for a crisp terminal/HUD silhouette
+			rl.DrawRectangle(chatX, panelY, 3, panelH, borderCol)
+
+			if chatActive {
+				rl.DrawRectangle(chatX+3, panelY+1, chatBoxW-4, headerH-1, rl.NewColor(18, 25, 38, 240))
+				rl.DrawText("COMMS CHANNEL  |  /help  /nick  /say  /w  /portal", chatX+chatPadX, panelY+4, 13, rl.SkyBlue)
+			}
+
+			rl.BeginScissorMode(chatX+4, panelY+headerH+2, chatBoxW-8, bodyH-4)
+			if len(wrappedLines) == 0 {
+				rl.DrawText("No messages yet. Type below and press [Enter] to send...", chatX+chatPadX, panelY+headerH+chatPadY, 15, rl.Gray)
+			} else {
+				cy := panelY + headerH + chatPadY
+				for _, wl := range wrappedLines {
+					rl.DrawText(wl.text, chatX+chatPadX, cy, chatFontSize, wl.color)
+					cy += chatLineH
+				}
+			}
+			rl.EndScissorMode()
 		}
 
 		if chatActive {
-			rl.DrawRectangle(12, sh-40, chatBoxW, 28, rl.NewColor(22, 30, 44, 235))
-			rl.DrawRectangleLines(12, sh-40, chatBoxW, 28, rl.Lime)
-			rl.DrawText("> "+chatInput+"_", 20, sh-35, 17, rl.Lime)
+			inputY := sh - 40
+			inputH := int32(28)
+			rl.DrawRectangle(chatX, inputY, chatBoxW, inputH, rl.NewColor(18, 26, 38, 245))
+			rl.DrawRectangleLines(chatX, inputY, chatBoxW, inputH, rl.Lime)
+			cursorBlink := "_"
+			if int(rl.GetTime()*2.2)%2 == 1 {
+				cursorBlink = " "
+			}
+			renderedInput := fitInputTail("> ", chatInput, cursorBlink, 17, chatBoxW-18)
+			rl.BeginScissorMode(chatX+4, inputY+2, chatBoxW-8, inputH-4)
+			rl.DrawText(renderedInput, chatX+9, inputY+6, 17, rl.Lime)
+			rl.EndScissorMode()
 		} else {
-			rl.DrawText("[I] Inv/Trade | [C] 3rd-Person | [F] Walk/Fly | [R] Spawn | [T] Chat | [V] Voice | [F1] Help | [F2] Settings | [F3] Peers", 14, sh-30, 15, rl.Gray)
+			hintTxt := "[I] Inv/Trade | [C] 3rd-Person | [F] Walk/Fly | [R] Spawn | [T] Chat | [V] Voice | [F1] Help | [F2] Settings | [F3] Peers"
+			if rl.MeasureText(hintTxt, 15) > sw-28 {
+				hintTxt = "[I] Inv | [C] 3P | [F] Walk/Fly | [T] Chat | [V] Voice | [F1] Help | [F2] Settings | [F3] Peers"
+			}
+			rl.DrawText(hintTxt, 14, sh-30, 15, rl.Gray)
 		}
 
 		if invOpen {
@@ -2793,7 +2873,7 @@ func main() {
 							prefix = "-> "
 							col = rl.Gold
 						}
-						rl.DrawText(fmt.Sprintf("%s%s (%s...)", prefix, p.Nick, p.PubKey[:12]), mx+24, my+int32(178+i*28), 17, col)
+						rl.DrawText(fmt.Sprintf("%s%s (%s...)", prefix, formatPeerTag(p.Nick, p.PubKey), p.PubKey[:12]), mx+24, my+int32(178+i*28), 17, col)
 					}
 				}
 				rl.DrawText("[Up/Down] Recipient | [L] Toggle Vendor-Lock | [Enter] Sign & Send | [Esc] Back", mx+24, my+mh-34, 15, rl.Gray)
@@ -2888,7 +2968,7 @@ func main() {
 						tag = " [BLOCKED]"
 					}
 					dist := rl.Vector3Distance(cam.Position, p.Pos)
-					rl.DrawText(fmt.Sprintf("%s%s (%s...) — %.1fm%s", prefix, p.Nick, p.PubKey[:12], dist, tag), mx+24, my+int32(60+i*30), 17, col)
+					rl.DrawText(fmt.Sprintf("%s%s (%s...) — %.1fm%s", prefix, formatPeerTag(p.Nick, p.PubKey), p.PubKey[:12], dist, tag), mx+24, my+int32(60+i*30), 17, col)
 				}
 			}
 			rl.DrawText("[Up/Down] Select | [Enter] Teleport To | [B] Block/Mute | [F3 / Esc] Close", mx+24, my+mh-34, 15, rl.Gray)
@@ -2996,6 +3076,71 @@ func sanitizeFileName(raw string) string {
 		return "asset.glb"
 	}
 	return out
+}
+
+type renderedChatLine struct {
+	text  string
+	color rl.Color
+}
+
+func wrapChatLine(text string, fontSize, maxWidth int32) []string {
+	if text == "" {
+		return nil
+	}
+	if maxWidth <= 40 || rl.MeasureText(text, fontSize) <= maxWidth {
+		return []string{text}
+	}
+	var out []string
+	words := strings.Fields(text)
+	cur := ""
+	for _, w := range words {
+		candidate := w
+		if cur != "" {
+			candidate = cur + " " + w
+		}
+		if rl.MeasureText(candidate, fontSize) <= maxWidth {
+			cur = candidate
+			continue
+		}
+		if cur != "" {
+			out = append(out, cur)
+			cur = ""
+		}
+		// Break oversized single tokens (such as 64-char pubkeys or URLs) by rune width
+		if rl.MeasureText(w, fontSize) > maxWidth {
+			var chunk strings.Builder
+			for _, r := range w {
+				test := chunk.String() + string(r)
+				if rl.MeasureText(test, fontSize) > maxWidth && chunk.Len() > 0 {
+					out = append(out, chunk.String())
+					chunk.Reset()
+				}
+				chunk.WriteRune(r)
+			}
+			cur = chunk.String()
+		} else {
+			cur = w
+		}
+	}
+	if cur != "" {
+		out = append(out, cur)
+	}
+	return out
+}
+
+func fitInputTail(prefix, input, suffix string, fontSize, maxWidth int32) string {
+	full := prefix + input + suffix
+	if maxWidth <= 40 || rl.MeasureText(full, fontSize) <= maxWidth {
+		return full
+	}
+	runes := []rune(input)
+	for i := 1; i <= len(runes); i++ {
+		cand := prefix + "..." + string(runes[i:]) + suffix
+		if rl.MeasureText(cand, fontSize) <= maxWidth {
+			return cand
+		}
+	}
+	return prefix + suffix
 }
 
 func drawMiniRadar(cx, cy, radius int32, cam rl.Camera3D, lookVec rl.Vector3, ns *NetState) {
@@ -3116,7 +3261,7 @@ func handleChatCommand(
 			return
 		}
 		_ = ns.sendJSON(WireMsg{Type: "CHAT", Channel: "whisper", TargetPub: targetPub, Text: msgText})
-		ns.addChat(fmt.Sprintf("[WHISPER -> %s (%s)]: %s", targetNick, n, msgText))
+		ns.addChat(fmt.Sprintf("[WHISPER -> %s (%s)]: %s", formatPeerTag(targetNick, targetPub), formatPeerTag(n, kp.PubHex()), msgText))
 		return
 	}
 	if strings.HasPrefix(input, "/mint ") {
@@ -3182,7 +3327,7 @@ func handleChatCommand(
 			ns.mu.RLock()
 			n := ns.nick
 			ns.mu.RUnlock()
-			ns.addChat(fmt.Sprintf("[LOCAL %s]: %s", n, txt))
+			ns.addChat(fmt.Sprintf("[LOCAL %s]: %s", formatPeerTag(n, kp.PubHex()), txt))
 		}
 		return
 	}
@@ -3191,7 +3336,7 @@ func handleChatCommand(
 	ns.mu.RLock()
 	n := ns.nick
 	ns.mu.RUnlock()
-	ns.addChat(fmt.Sprintf("[%s]: %s", n, input))
+	ns.addChat(fmt.Sprintf("[%s]: %s", formatPeerTag(n, kp.PubHex()), input))
 }
 
 func runRelayLoop(ctx context.Context, relayURL string, kp *identity.Keypair, ns *NetState) {
@@ -3474,10 +3619,7 @@ func runRelaySession(ctx context.Context, conn *websocket.Conn, relayHost string
 				continue
 			}
 
-			label := sanitizeDisplayText(msg.Nick, 24)
-			if label == "" && len(msg.PubKey) >= 8 {
-				label = msg.PubKey[:8]
-			}
+			label := formatPeerTag(msg.Nick, msg.PubKey)
 			prefix := ""
 			if msg.Channel == "proximity" {
 				prefix = "LOCAL "
@@ -3514,10 +3656,7 @@ func handleTransferWhisper(ns *NetState, msg WireMsg) {
 			log.Printf("Rejected invalid transfer offer license from %s: %v", msg.PubKey[:8], err)
 			return
 		}
-		senderNick := sanitizeDisplayText(msg.Nick, 24)
-		if senderNick == "" && len(msg.PubKey) >= 8 {
-			senderNick = msg.PubKey[:8]
-		}
+		senderNick := formatPeerTag(msg.Nick, msg.PubKey)
 		safeName := sanitizeFileName(xfer.FileName)
 		kind := "prop"
 		if xfer.AssetKind == "avatar" {
