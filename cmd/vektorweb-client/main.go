@@ -332,6 +332,12 @@ func (n *NetState) sendBinary(payload []byte) error {
 	return c.WriteMessage(websocket.BinaryMessage, payload)
 }
 
+func (n *NetState) clearChat() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.chatLog = nil
+}
+
 func (n *NetState) addChatColor(line string, col rl.Color) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -1449,6 +1455,9 @@ func main() {
 	var pendingDrop *PendingDrop
 
 	chatInput := ""
+	var chatHistory []string
+	chatHistIdx := -1
+	chatDraft := ""
 	luaHUD := ""
 	lastSync := time.Now()
 	lastJanitor := time.Now()
@@ -1866,7 +1875,7 @@ func main() {
 					lookedAt = &RayTarget{
 						Kind:      "prop",
 						ID:        prop.PropID,
-						Label:     "Prop " + prop.PropID[:6],
+						Label:     "Prop " + prop.PropID[:minInt(6, len(prop.PropID))],
 						SubLabel:  sub,
 						CanDelete: canDel,
 						Box:       box,
@@ -2163,9 +2172,13 @@ func main() {
 		} else if !chatActive {
 			if rl.IsKeyPressed(rl.KeyT) {
 				chatActive = true
+				chatHistIdx = len(chatHistory)
+				chatDraft = ""
 			} else if rl.IsKeyPressed(rl.KeySlash) {
 				chatActive = true
 				chatInput = "/"
+				chatHistIdx = len(chatHistory)
+				chatDraft = "/"
 			} else {
 				if rl.IsKeyPressed(rl.KeyF) {
 					walkMode = !walkMode
@@ -2373,22 +2386,65 @@ func main() {
 			pttActive = false
 			pttMu.Unlock()
 
+			// Ctrl+V clipboard paste into chat input
+			if (rl.IsKeyDown(rl.KeyLeftControl) || rl.IsKeyDown(rl.KeyRightControl)) && rl.IsKeyPressed(rl.KeyV) {
+				clip := sanitizeDisplayText(rl.GetClipboardText(), 240)
+				if clip != "" {
+					rem := 240 - len([]rune(chatInput))
+					if rem > 0 {
+						clipRunes := []rune(clip)
+						if len(clipRunes) > rem {
+							clipRunes = clipRunes[:rem]
+						}
+						chatInput += string(clipRunes)
+					}
+				}
+			}
+			// Up/Down arrow history recall
+			if rl.IsKeyPressed(rl.KeyUp) && len(chatHistory) > 0 {
+				if chatHistIdx == len(chatHistory) {
+					chatDraft = chatInput
+				}
+				if chatHistIdx > 0 {
+					chatHistIdx--
+					chatInput = chatHistory[chatHistIdx]
+				}
+			} else if rl.IsKeyPressed(rl.KeyDown) && len(chatHistory) > 0 {
+				if chatHistIdx < len(chatHistory)-1 {
+					chatHistIdx++
+					chatInput = chatHistory[chatHistIdx]
+				} else if chatHistIdx == len(chatHistory)-1 {
+					chatHistIdx = len(chatHistory)
+					chatInput = chatDraft
+				}
+			}
 			for key := rl.GetCharPressed(); key > 0; key = rl.GetCharPressed() {
-				if key >= 32 && key <= 125 && len(chatInput) < 200 {
+				if key >= 32 && key <= 126 && len([]rune(chatInput)) < 240 {
 					chatInput += string(rune(key))
 				}
 			}
-			if rl.IsKeyPressed(rl.KeyBackspace) && len(chatInput) > 0 {
-				chatInput = chatInput[:len(chatInput)-1]
+			if (rl.IsKeyPressed(rl.KeyBackspace) || rl.IsKeyPressedRepeat(rl.KeyBackspace)) && len(chatInput) > 0 {
+				runes := []rune(chatInput)
+				chatInput = string(runes[:len(runes)-1])
 			}
 			if rl.IsKeyPressed(rl.KeyEnter) {
-				if chatInput != "" {
-					handleChatCommand(chatInput, kp, netState, hopToWorld, &avatarInv, &propInv, &localAvHash, exportsDir, &spawn, playerHeadPos, activeWorld.URL, worldModel, &cfg, settingsPath)
+				if strings.TrimSpace(chatInput) != "" {
+					if len(chatHistory) == 0 || chatHistory[len(chatHistory)-1] != chatInput {
+						chatHistory = append(chatHistory, chatInput)
+						if len(chatHistory) > 25 {
+							chatHistory = chatHistory[len(chatHistory)-25:]
+						}
+					}
+					handleChatCommand(chatInput, kp, netState, hopToWorld, &avatarInv, &propInv, &localAvHash, exportsDir, &spawn, playerHeadPos, activeWorld.URL, activeWorld.Manifest.World.Title, worldModel, &cfg, settingsPath, &directory, dirPath)
 					chatInput = ""
 				}
+				chatHistIdx = len(chatHistory)
+				chatDraft = ""
 				chatActive = false
 			} else if rl.IsKeyPressed(rl.KeyEscape) {
 				chatInput = ""
+				chatHistIdx = len(chatHistory)
+				chatDraft = ""
 				chatActive = false
 			}
 		}
@@ -2783,7 +2839,7 @@ func main() {
 
 			if chatActive {
 				rl.DrawRectangle(chatX+3, panelY+1, chatBoxW-4, headerH-1, rl.NewColor(18, 25, 38, 240))
-				rl.DrawText("COMMS CHANNEL  |  /help  /nick  /say  /w  /portal", chatX+chatPadX, panelY+4, 13, rl.SkyBlue)
+				rl.DrawText("COMMS  |  /help /clear /nick /bookmark /copykey  |  [Up/Dn] History", chatX+chatPadX, panelY+4, 13, rl.SkyBlue)
 			}
 
 			rl.BeginScissorMode(chatX+4, panelY+headerH+2, chatBoxW-8, bodyH-4)
@@ -3034,7 +3090,7 @@ func main() {
 				"WASD + Mouse     : Walk / Look ([Shift] Sprint, [Space] Jump, [F] Walk/Fly)",
 				"[C] / [R]        : Toggle 3rd-Person View (Wheel zooms) / Return to Spawn",
 				"Look-At Target   : [Del] Remove your prop | [E] Offer trade to peer",
-				"[T] or [/]       : Chat (/help, /nick, /say, /w, /portal, /setspawn, /pubkey, /mint, /chatlog)",
+				"[T] or [/]       : Chat (/help, /clear, /nick, /bookmark, /copykey, /setspawn, /mint)",
 				"[V] / [M]        : Hold Push-to-Talk voice (35m) / Mute incoming voice",
 				"[G]/[Esc] [B] [N]: Toggle/Exit Build Mode / Snap-to-Grid / Next prop ([F4] Set Spawn)",
 				"[Q]/[E] [PgUp/Dn]: Rotate & nudge prop height ([+/-] scale, [P]/[X] place/undo)",
@@ -3048,6 +3104,13 @@ func main() {
 
 		rl.EndDrawing()
 	}
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func clampFloat32(v, minV, maxV float32) float32 {
@@ -3185,13 +3248,60 @@ func handleChatCommand(
 	spawn *rl.Vector3,
 	curPos rl.Vector3,
 	activeWorldURL string,
+	activeWorldTitle string,
 	worldModel rl.Model,
 	cfg *ClientSettings,
 	settingsPath string,
+	directory *WorldDirectory,
+	dirPath string,
 ) {
 	if input == "/help" || input == "/?" || strings.HasPrefix(input, "/help ") {
-		ns.addChat("[HELP]: Commands: /help, /nick <name>, /say <msg>, /w <peer> <msg>, /portal <url>, /setspawn [x y z], /pubkey, /mint <pub> <lock|free>, /chatlog")
-		ns.addChat("[HELP]: Keys: [F1] Full Help | [I] Inventory | [G]/[Esc] Build Mode | [C] 3rd-Person | [F] Walk/Fly | [R] Spawn | [V] Voice")
+		ns.addChat("[HELP]: Commands: /help, /clear, /nick <name>, /say <msg>, /w <peer> <msg>, /portal <url>, /bookmark [name], /setspawn [x y z], /pubkey, /copykey, /mint <pub> <lock|free>, /chatlog")
+		ns.addChat("[HELP]: Keys: [F1] Full Help | [I] Inventory | [G]/[Esc] Build Mode | [C] 3rd-Person | [F] Walk/Fly | [R] Spawn | [V] Voice | [Up/Dn] Chat History")
+		return
+	}
+	if input == "/clear" {
+		ns.clearChat()
+		return
+	}
+	if input == "/copykey" {
+		rl.SetClipboardText(kp.PubHex())
+		ns.addChat("[PUBKEY]: Copied " + kp.PubHex()[:16] + "... to clipboard!")
+		return
+	}
+	if input == "/bookmark" || strings.HasPrefix(input, "/bookmark ") {
+		if activeWorldURL == "" || activeWorldURL == "local://sandbox" {
+			ns.addChat("[BOOKMARK]: Cannot bookmark the built-in local://sandbox")
+			return
+		}
+		bmName := sanitizeDisplayText(strings.TrimSpace(strings.TrimPrefix(input, "/bookmark")), 48)
+		if bmName == "" {
+			bmName = sanitizeDisplayText(activeWorldTitle, 48)
+		}
+		if bmName == "" {
+			bmName = activeWorldURL
+		}
+		if directory != nil {
+			updated := false
+			for i := range directory.Worlds {
+				if normalizeWorldURL(directory.Worlds[i].URL) == normalizeWorldURL(activeWorldURL) {
+					directory.Worlds[i].Name = bmName
+					updated = true
+					break
+				}
+			}
+			if !updated {
+				directory.Worlds = append(directory.Worlds, struct {
+					Name string `toml:"name"`
+					URL  string `toml:"url"`
+				}{Name: bmName, URL: activeWorldURL})
+			}
+			if err := saveWorldDirectory(dirPath, *directory); err == nil {
+				ns.addChat(fmt.Sprintf("[BOOKMARK]: Saved %q to [Tab] World Directory", bmName))
+			} else {
+				ns.addChat("[BOOKMARK ERR]: " + err.Error())
+			}
+		}
 		return
 	}
 	if input == "/setspawn" || strings.HasPrefix(input, "/setspawn ") {
@@ -3277,6 +3387,10 @@ func handleChatCommand(
 			if len(*propInv) > 0 {
 				targetHash = (*propInv)[0].Hash
 			}
+		}
+		if !isValidHex64(targetHash) {
+			ns.addChat("[MINT ERR]: Equip an avatar or select a prop .glb before minting a license")
+			return
 		}
 		lic, err := kp.MintAssetLicense(targetHash, buyerPub, transferable)
 		if err != nil {
@@ -3850,6 +3964,21 @@ func loadWorldDirectory(path, fallbackURL string) WorldDirectory {
 		}{Name: "Default World", URL: fallbackURL})
 	}
 	return d
+}
+
+func saveWorldDirectory(path string, d WorldDirectory) error {
+	var sb strings.Builder
+	for i, w := range d.Worlds {
+		if i > 0 {
+			sb.WriteString("\n")
+		}
+		fmt.Fprintf(&sb, "[[worlds]]\nname = %q\nurl = %q\n", w.Name, w.URL)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(sb.String()), 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func fetchManifest(rawURL string) (*WorldManifest, string, error) {

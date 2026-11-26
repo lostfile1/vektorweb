@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -80,6 +81,7 @@ type StatusResponse struct {
 	ProtoVersion  int    `json:"proto_version"`
 	Title         string `json:"title"`
 	Domain        string `json:"domain"`
+	WorldURL      string `json:"world_url,omitempty"`
 	PlacementMode string `json:"placement_mode"`
 	Online        int    `json:"online"`
 	Props         int    `json:"props"`
@@ -185,6 +187,8 @@ type RelayServer struct {
 	serveHTTP     bool
 	placementMode string
 	trustProxy    bool
+	announceURL   string
+	worldURL      string
 	startedAt     time.Time
 
 	mu              sync.RWMutex
@@ -209,6 +213,7 @@ func main() {
 	serveHTTP := flag.Bool("http", true, "Serve world files over HTTP on the same port (disable if using Apache/Nginx)")
 	placement := flag.String("placement", "ephemeral", "Prop placement mode: forbid | ephemeral | persistent")
 	trustProxy := flag.Bool("trust-proxy", false, "Trust X-Real-IP / X-Forwarded-For headers from a local reverse proxy (Nginx/Caddy)")
+	announceFlag := flag.String("announce", "", "Optional public directory HTTP(S) URL to POST status pings every 60s")
 	adminFlag := flag.String("admin", "", "Comma-separated 64-char hex Ed25519 admin public keys (in addition to world.toml rules.admins)")
 	flag.Parse()
 
@@ -247,12 +252,30 @@ func main() {
 		}
 	}
 
+	port := "7777"
+	if idx := strings.LastIndex(*addr, ":"); idx != -1 {
+		port = (*addr)[idx+1:]
+	}
+	joinURL := fmt.Sprintf("http://%s:%s/world.toml", resolvedDomain, port)
+	if port == "443" {
+		joinURL = fmt.Sprintf("https://%s/world.toml", resolvedDomain)
+	} else if port == "80" {
+		joinURL = fmt.Sprintf("http://%s/world.toml", resolvedDomain)
+	}
+
+	announceTarget := strings.TrimSpace(*announceFlag)
+	if announceTarget != "" && !strings.HasPrefix(announceTarget, "http://") && !strings.HasPrefix(announceTarget, "https://") {
+		log.Fatalf("invalid -announce URL %q (must start with http:// or https://)", announceTarget)
+	}
+
 	srv := &RelayServer{
 		domain:        resolvedDomain,
 		worldDir:      *worldDir,
 		serveHTTP:     *serveHTTP,
 		placementMode: *placement,
 		trustProxy:    *trustProxy,
+		announceURL:   announceTarget,
+		worldURL:      joinURL,
 		startedAt:     time.Now(),
 		worldTitle:    "VektorWeb World",
 		worldSpawn:    []float32{0.0, 2.0, 10.0},
@@ -284,17 +307,17 @@ func main() {
 	}
 
 	displayHost := resolvedDomain
-	port := "7777"
-	if idx := strings.LastIndex(*addr, ":"); idx != -1 {
-		port = (*addr)[idx+1:]
-	}
 
 	log.Printf("vektorweb-relay v%d listening on %s (domain=%s, placement=%s, trust_proxy=%v)",
 		ProtocolVersion, *addr, resolvedDomain, *placement, *trustProxy)
 	log.Printf("World folder : %s", *worldDir)
 	if *serveHTTP {
-		log.Printf("Join URL     : http://%s:%s/world.toml", displayHost, port)
+		log.Printf("Join URL     : %s", joinURL)
 		log.Printf("Status URL   : http://%s:%s/status.json", displayHost, port)
+	}
+	if announceTarget != "" {
+		log.Printf("Announcing   : %s (every 60s)", announceTarget)
+		go srv.announceLoop()
 	}
 
 	stop := make(chan os.Signal, 1)
@@ -568,6 +591,52 @@ func buildPlazaGLB(w, h, d float32) []byte {
 	return out
 }
 
+func (s *RelayServer) announceLoop() {
+	httpClient := &http.Client{Timeout: 8 * time.Second}
+	s.postStatusPing(httpClient)
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.postStatusPing(httpClient)
+	}
+}
+
+func (s *RelayServer) postStatusPing(client *http.Client) {
+	if s.announceURL == "" {
+		return
+	}
+	s.mu.RLock()
+	payload := StatusResponse{
+		ProtoVersion:  ProtocolVersion,
+		Title:         s.worldTitle,
+		Domain:        s.domain,
+		WorldURL:      s.worldURL,
+		PlacementMode: s.placementMode,
+		Online:        len(s.clients),
+		Props:         len(s.props),
+		UptimeSec:     int64(time.Since(s.startedAt).Seconds()),
+	}
+	s.mu.RUnlock()
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	req, err := http.NewRequest(http.MethodPost, s.announceURL, bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", fmt.Sprintf("vektorweb-relay/%d", ProtocolVersion))
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Directory announce failed: %v", err)
+		return
+	}
+	_ = resp.Body.Close()
+}
+
 func (s *RelayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -578,6 +647,7 @@ func (s *RelayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 		ProtoVersion:  ProtocolVersion,
 		Title:         s.worldTitle,
 		Domain:        s.domain,
+		WorldURL:      s.worldURL,
 		PlacementMode: s.placementMode,
 		Online:        len(s.clients),
 		Props:         len(s.props),
