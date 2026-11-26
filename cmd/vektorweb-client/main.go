@@ -873,6 +873,18 @@ func startMicCapture(ctx context.Context, ns *NetState, pttActive *bool, mu *syn
 	}()
 }
 
+func worldOnlyMarkerPath(cacheDir, hash string) string {
+	return filepath.Join(cacheDir, strings.ToLower(hash)+".world_only")
+}
+
+func isWorldOnlyAsset(cacheDir, hash string) bool {
+	if !isValidHex64(hash) {
+		return false
+	}
+	_, err := os.Stat(worldOnlyMarkerPath(cacheDir, hash))
+	return err == nil
+}
+
 func licensePathForGLB(glbPath string) string {
 	ext := filepath.Ext(glbPath)
 	if ext != "" {
@@ -918,6 +930,7 @@ func scanInventoryFolder(folder, kind, cacheDir, localPubKey string, maxBytes in
 				log.Printf("Skipping %s: invalid or unauthorized license (%v)", e.Name(), err)
 				continue
 			}
+			_ = os.Remove(worldOnlyMarkerPath(cacheDir, h))
 			isCreator = strings.EqualFold(lic.CreatorPub, localPubKey)
 			if isCreator {
 				statusTag = " [CREATOR]"
@@ -929,6 +942,9 @@ func scanInventoryFolder(folder, kind, cacheDir, localPubKey string, maxBytes in
 				statusTag = " [VENDOR-LOCKED]"
 				canSend = false
 			}
+		} else if isWorldOnlyAsset(cacheDir, h) {
+			log.Printf("Skipping %s: display-only world/peer asset (no ownership license for %s)", e.Name(), localPubKey[:8])
+			continue
 		}
 
 		localAssets[h] = b
@@ -1346,7 +1362,12 @@ func main() {
 				if err := lic.Verify(h, kp.PubHex()); err != nil {
 					log.Printf("Avatar license rejected: %v", err)
 					licOk = false
+				} else {
+					_ = os.Remove(worldOnlyMarkerPath(cacheDir, h))
 				}
+			} else if isWorldOnlyAsset(cacheDir, h) {
+				log.Printf("Avatar rejected: display-only world/peer asset")
+				licOk = false
 			}
 			if licOk {
 				localAvHash = h
@@ -1428,6 +1449,7 @@ func main() {
 						glbURL := strings.TrimRight(baseURL, "/") + "/" + hashHex + ".glb"
 						b, err := fetchBytes(glbURL, int64(maxItemMB)*1024*1024)
 						if err != nil {
+							_ = netState.sendJSON(WireMsg{Type: "REQ_ASSET", Hash: hashHex})
 							return
 						}
 						if !strings.EqualFold(identity.FileSHA256(b), hashHex) {
@@ -1437,6 +1459,9 @@ func main() {
 							return
 						}
 						_ = os.WriteFile(filepath.Join(cacheDir, hashHex+".glb"), b, 0644)
+						if _, err := os.Stat(filepath.Join(cacheDir, hashHex+".license.json")); os.IsNotExist(err) {
+							_ = os.WriteFile(worldOnlyMarkerPath(cacheDir, hashHex), []byte("display_only\n"), 0644)
+						}
 						netState.mu.Lock()
 						netState.localAssets[hashHex] = b
 						netState.readyModels = append(netState.readyModels, hashHex)
@@ -1457,8 +1482,8 @@ func main() {
 			go runRelayLoop(ctx, w.Manifest.World.RelayURL, kp, netState)
 		}
 	}
-	seedBakedProps(activeWorld)
 	startRelayForWorld(activeWorld)
+	seedBakedProps(activeWorld)
 
 	rl.SetConfigFlags(rl.FlagWindowResizable | rl.FlagMsaa4xHint)
 	rl.InitWindow(1280, 720, "VektorWeb - "+activeWorld.Manifest.World.Title)
@@ -1612,8 +1637,8 @@ func main() {
 				}
 			}
 		}
-		seedBakedProps(activeWorld)
 		startRelayForWorld(activeWorld)
+		seedBakedProps(activeWorld)
 		netState.addChat("[PORTAL]: Arrived at " + activeWorld.Manifest.World.Title)
 	}
 
@@ -1847,12 +1872,22 @@ func main() {
 					continue
 				}
 				h := identity.FileSHA256(b)
+				var dropLic *identity.AssetLicense
 				if lic, err := identity.LoadAssetLicense(licensePathForGLB(fpath)); err == nil {
 					if err := lic.Verify(h, kp.PubHex()); err != nil {
 						netState.addChat("[LICENSE ERR]: " + err.Error())
 						continue
 					}
+					dropLic = lic
+					_ = os.Remove(worldOnlyMarkerPath(cacheDir, h))
 					_ = identity.SaveAssetLicense(filepath.Join(cacheDir, h+".license.json"), lic)
+				} else if lic, err := identity.LoadAssetLicense(filepath.Join(cacheDir, h+".license.json")); err == nil && lic.Verify(h, kp.PubHex()) == nil {
+					dropLic = lic
+					_ = os.Remove(worldOnlyMarkerPath(cacheDir, h))
+				}
+				if dropLic == nil && isWorldOnlyAsset(cacheDir, h) {
+					netState.addChat("[DRM]: Cannot import display-only world/peer asset without a creator license!")
+					continue
 				}
 				pendingDrop = &PendingDrop{
 					FileName: sanitizeFileName(filepath.Base(fpath)),
@@ -1865,7 +1900,6 @@ func main() {
 		}
 
 		if pendingDrop != nil {
-			drawModalBackdrop(sw, sh)
 			if rl.IsKeyPressed(rl.KeyOne) {
 				destP := filepath.Join(avatarsDir, pendingDrop.FileName)
 				_ = os.WriteFile(destP, pendingDrop.Bytes, 0644)
@@ -2004,7 +2038,6 @@ func main() {
 
 		// Handle incoming client-to-client transfer offer prompt ([Y] Accept / [N] Decline)
 		if hasIncomingOffer && pendingDrop == nil {
-			drawModalBackdrop(sw, sh)
 			netState.mu.Lock()
 			offer := netState.incomingXfers[0]
 			netState.mu.Unlock()
@@ -2052,14 +2085,12 @@ func main() {
 			if rl.IsKeyPressed(rl.KeyF1) {
 				helpOpen = !helpOpen
 				if helpOpen {
-			drawModalBackdrop(sw, sh)
 					invOpen, dirOpen, settingsOpen, peersOpen, transferModalOpen = false, false, false, false, false
 				}
 			}
 			if rl.IsKeyPressed(rl.KeyF2) {
 				settingsOpen = !settingsOpen
 				if settingsOpen {
-			drawModalBackdrop(sw, sh)
 					invOpen, dirOpen, helpOpen, peersOpen, transferModalOpen = false, false, false, false, false
 					settingsCursor = 0
 				}
@@ -2067,7 +2098,6 @@ func main() {
 			if rl.IsKeyPressed(rl.KeyF3) {
 				peersOpen = !peersOpen
 				if peersOpen {
-			drawModalBackdrop(sw, sh)
 					invOpen, dirOpen, helpOpen, settingsOpen, transferModalOpen = false, false, false, false, false
 					peerCursor = 0
 				}
@@ -2084,7 +2114,6 @@ func main() {
 				preselectedPeerPub = ""
 				dirOpen, helpOpen, settingsOpen, peersOpen = false, false, false, false
 				if invOpen {
-			drawModalBackdrop(sw, sh)
 					avatarInv = scanInventoryFolder(avatarsDir, "avatar", cacheDir, kp.PubHex(), maxAvMB*1024*1024, localAssets)
 					propInv = scanInventoryFolder(itemsDir, "prop", cacheDir, kp.PubHex(), maxItemMB*1024*1024, localAssets)
 					for _, it := range propInv {
@@ -2114,7 +2143,6 @@ func main() {
 				dirOpen = !dirOpen
 				invOpen, transferModalOpen, helpOpen, settingsOpen, peersOpen = false, false, false, false, false
 				if dirOpen {
-			drawModalBackdrop(sw, sh)
 					dirCursor = 0
 					refreshPortalStatuses(directory)
 				}
@@ -3334,6 +3362,7 @@ func main() {
 		}
 
 		if invOpen {
+			drawModalBackdrop(sw, sh)
 			mw, mh := int32(720), int32(450)
 			mx, my := (sw-mw)/2, (sh-mh)/2
 			drawGlassPanel(mx, my, mw, mh, rl.SkyBlue, 246)
@@ -3420,6 +3449,7 @@ func main() {
 		}
 
 		if settingsOpen {
+			drawModalBackdrop(sw, sh)
 			mw, mh := int32(580), int32(375)
 			mx, my := (sw-mw)/2, (sh-mh)/2
 			drawGlassPanel(mx, my, mw, mh, rl.SkyBlue, 246)
@@ -3447,6 +3477,7 @@ func main() {
 		}
 
 		if peersOpen {
+			drawModalBackdrop(sw, sh)
 			mw, mh := int32(640), int32(380)
 			mx, my := (sw-mw)/2, (sh-mh)/2
 			drawGlassPanel(mx, my, mw, mh, rl.SkyBlue, 246)
@@ -3490,6 +3521,7 @@ func main() {
 		}
 
 		if hasIncomingOffer && pendingDrop == nil {
+			drawModalBackdrop(sw, sh)
 			netState.mu.RLock()
 			offer := netState.incomingXfers[0]
 			netState.mu.RUnlock()
@@ -3509,6 +3541,7 @@ func main() {
 		}
 
 		if pendingDrop != nil {
+			drawModalBackdrop(sw, sh)
 			mw, mh := int32(600), int32(210)
 			mx, my := (sw-mw)/2, (sh-mh)/2
 			drawGlassPanel(mx, my, mw, mh, rl.Lime, 248)
@@ -3520,6 +3553,7 @@ func main() {
 		}
 
 		if dirOpen {
+			drawModalBackdrop(sw, sh)
 			mw, mh := int32(720), int32(430)
 			mx, my := (sw-mw)/2, (sh-mh)/2
 			drawGlassPanel(mx, my, mw, mh, rl.SkyBlue, 246)
@@ -3582,6 +3616,7 @@ func main() {
 		}
 
 		if helpOpen {
+			drawModalBackdrop(sw, sh)
 			mw, mh := int32(720), int32(530)
 			mx, my := (sw-mw)/2, (sh-mh)/2
 			drawGlassPanel(mx, my, mw, mh, rl.Gold, 246)
@@ -4611,7 +4646,14 @@ func runRelaySession(ctx context.Context, conn *websocket.Conn, relayHost string
 			ns.mu.Unlock()
 
 			if needAsset {
-				_ = ns.sendJSON(WireMsg{Type: "REQ_ASSET", TargetPub: msg.PubKey, Hash: msg.Hash})
+				ns.mu.RLock()
+				_, ownerOnline := ns.peers[msg.PubKey]
+				ns.mu.RUnlock()
+				if ownerOnline && isValidHex64(msg.PubKey) {
+					_ = ns.sendJSON(WireMsg{Type: "REQ_ASSET", TargetPub: msg.PubKey, Hash: msg.Hash})
+				} else {
+					_ = ns.sendJSON(WireMsg{Type: "REQ_ASSET", Hash: msg.Hash})
+				}
 			}
 
 		case "PROP_REMOVE":
@@ -4631,7 +4673,15 @@ func runRelaySession(ctx context.Context, conn *websocket.Conn, relayHost string
 			data, ok := ns.localAssets[msg.Hash]
 			ns.mu.RUnlock()
 			if ok && len(data) > 0 {
-				go streamAssetChunks(ns, msg.PubKey, msg.Hash, data)
+				isSwarm := (msg.TargetPub == "")
+				go func(requesterPub, assetHash string, blob []byte, swarm bool) {
+					if swarm {
+						var jb [1]byte
+						_, _ = rand.Read(jb[:])
+						time.Sleep(time.Duration(jb[0]%120) * time.Millisecond)
+					}
+					streamAssetChunks(ns, requesterPub, assetHash, blob)
+				}(msg.PubKey, msg.Hash, data, isSwarm)
 			}
 
 		case "ASSET_CHUNK":
@@ -4856,9 +4906,11 @@ func handleIncomingChunk(ns *NetState, msg WireMsg) {
 		delete(ns.pendingRecvFiles, hashLower)
 		delete(ns.pendingRecvFiles, msg.Hash)
 		ns.localAssets[hashLower] = full
+		myPub := ns.localPub
 		ns.mu.Unlock()
 
-		if pending != nil && pending.License != nil {
+		if pending != nil && pending.License != nil && pending.License.Verify(hashLower, myPub) == nil {
+			_ = os.Remove(worldOnlyMarkerPath(ns.cacheDir, hashLower))
 			destDir := ns.itemsDir
 			if pending.AssetKind == "avatar" {
 				destDir = ns.avatarsDir
@@ -4876,6 +4928,10 @@ func handleIncomingChunk(ns *NetState, msg WireMsg) {
 			ns.invDirty = true
 			ns.mu.Unlock()
 			ns.addChat(fmt.Sprintf("[TRANSFER]: Saved %s + signed license to your %s inventory!", safeName, pending.AssetKind))
+		} else {
+			if _, err := os.Stat(filepath.Join(ns.cacheDir, hashLower+".license.json")); os.IsNotExist(err) {
+				_ = os.WriteFile(worldOnlyMarkerPath(ns.cacheDir, hashLower), []byte("display_only\n"), 0644)
+			}
 		}
 	}
 }

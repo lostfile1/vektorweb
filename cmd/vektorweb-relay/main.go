@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -34,7 +35,9 @@ const (
 	MaxWireFrameBytes  = 512 * 1024
 	MaxVoiceFrameBytes = 32 * 1024
 	MaxAssetChunkChars = 128 * 1024
-	MaxPropsPerClient  = 32
+	MaxCachedPropBytes     = 10 * 1024 * 1024
+	MaxTotalPropCacheBytes = 256 * 1024 * 1024
+	MaxPropsPerClient      = 32
 	MaxTotalProps      = 512
 	PingInterval       = 25 * time.Second
 	PongWait           = 60 * time.Second
@@ -83,7 +86,8 @@ type WorldConfigTOML struct {
 		Spawn []float32 `toml:"spawn"`
 	} `toml:"world"`
 	Rules struct {
-		Admins []string `toml:"admins"`
+		PlacementMode string   `toml:"placement_mode"`
+		Admins        []string `toml:"admins"`
 	} `toml:"rules"`
 	Props []WorldBakedProp `toml:"props"`
 }
@@ -215,7 +219,15 @@ type RelayServer struct {
 	tomlModTime     time.Time
 	clients         map[string]*ClientConn
 	props           map[string]WireMsg
+	propAssemblies  map[string]*RelayAssetAssembler
 	ipConns         map[string]int
+}
+
+type RelayAssetAssembler struct {
+	FromPub   string
+	Total     int
+	Chunks    map[int][]byte
+	CreatedAt time.Time
 }
 
 func main() {
@@ -223,16 +235,16 @@ func main() {
 	domain := flag.String("domain", "", "Public domain or IP bound to Ed25519 challenges (auto-detected from -addr if empty)")
 	worldDir := flag.String("dir", "./world", "World folder to auto-create and serve")
 	serveHTTP := flag.Bool("http", true, "Serve world files over HTTP on the same port (disable if using Apache/Nginx)")
-	placement := flag.String("placement", "ephemeral", "Prop placement mode: forbid | ephemeral | persistent")
+	placement := flag.String("placement", "ephemeral", "Prop placement mode: forbid | ephemeral | admin_only | persistent")
 	trustProxy := flag.Bool("trust-proxy", false, "Trust X-Real-IP / X-Forwarded-For headers from a local reverse proxy (Nginx/Caddy)")
 	announceFlag := flag.String("announce", "", "Optional public directory HTTP(S) URL to POST status pings every 60s")
 	adminFlag := flag.String("admin", "", "Comma-separated 64-char hex Ed25519 admin public keys (in addition to world.toml rules.admins)")
 	flag.Parse()
 
 	switch *placement {
-	case "forbid", "ephemeral", "persistent":
+	case "forbid", "ephemeral", "admin_only", "persistent":
 	default:
-		log.Fatalf("invalid -placement %q (expected forbid, ephemeral, or persistent)", *placement)
+		log.Fatalf("invalid -placement %q (expected forbid, ephemeral, admin_only, or persistent)", *placement)
 	}
 
 	resolvedDomain := strings.TrimSpace(*domain)
@@ -296,14 +308,15 @@ func main() {
 		cliAdmins:     cliAdmins,
 		bannedKeys:    make(map[string]bool),
 		blockedItems:  make(map[string]bool),
-		clients:       make(map[string]*ClientConn),
-		props:         make(map[string]WireMsg),
-		ipConns:       make(map[string]int),
+		clients:        make(map[string]*ClientConn),
+		props:          make(map[string]WireMsg),
+		propAssemblies: make(map[string]*RelayAssetAssembler),
+		ipConns:        make(map[string]int),
 	}
 
 	srv.reloadConfigFiles(true)
 
-	if *placement == "persistent" {
+	if *placement == "persistent" || *placement == "admin_only" {
 		srv.loadPersistentProps()
 	}
 
@@ -376,6 +389,7 @@ func (s *RelayServer) watchLoop() {
 	defer ticker.Stop()
 	for range ticker.C {
 		s.reloadConfigFiles(false)
+		s.pruneStaleAssemblies()
 	}
 }
 
@@ -436,6 +450,10 @@ func (s *RelayServer) reloadConfigFiles(force bool) {
 					}
 				}
 				s.adminKeys = admins
+				pm := strings.ToLower(strings.TrimSpace(wc.Rules.PlacementMode))
+				if pm == "forbid" || pm == "ephemeral" || pm == "admin_only" || pm == "persistent" {
+					s.placementMode = pm
+				}
 
 				// Sync baked [[props]] defined in world.toml (prefixed "baked_")
 				activeBaked := make(map[string]bool)
@@ -516,6 +534,7 @@ func ensureWorldDir(dir, addr, domain string) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
+	_ = os.MkdirAll(filepath.Join(dir, "prop_cache"), 0755)
 
 	port := "7777"
 	if idx := strings.LastIndex(addr, ":"); idx != -1 {
@@ -834,7 +853,7 @@ func (s *RelayServer) handleRoot(w http.ResponseWriter, r *http.Request) {
 
 	cleanPath := filepath.Clean("/" + r.URL.Path)
 	base := filepath.Base(cleanPath)
-	if base == "bans.txt" || base == "blocked_items.txt" || base == "world_props.json" || strings.HasPrefix(base, ".") {
+	if strings.HasPrefix(cleanPath, "/prop_cache") || base == "bans.txt" || base == "blocked_items.txt" || base == "world_props.json" || strings.HasPrefix(base, ".") {
 		http.NotFound(w, r)
 		return
 	}
@@ -845,6 +864,210 @@ func (s *RelayServer) handleRoot(w http.ResponseWriter, r *http.Request) {
 	}
 	target := filepath.Join(s.worldDir, filepath.FromSlash(cleanPath))
 	http.ServeFile(w, r, target)
+}
+
+func (s *RelayServer) propCachePath(hash string) string {
+	return filepath.Join(s.worldDir, "prop_cache", strings.ToLower(hash)+".glb")
+}
+
+func (s *RelayServer) resolveCachedPropFile(hash string) (string, bool) {
+	if !isValidHex64(hash) {
+		return "", false
+	}
+	hLower := strings.ToLower(hash)
+	for _, p := range []string{
+		s.propCachePath(hLower),
+		filepath.Join(s.worldDir, hLower+".glb"),
+	} {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() && st.Size() >= 20 && st.Size() <= MaxCachedPropBytes {
+			return p, true
+		}
+	}
+	return "", false
+}
+
+func (s *RelayServer) hasCachedProp(hash string) bool {
+	_, ok := s.resolveCachedPropFile(hash)
+	return ok
+}
+
+func (s *RelayServer) propCacheDiskUsage() int64 {
+	entries, err := os.ReadDir(filepath.Join(s.worldDir, "prop_cache"))
+	if err != nil {
+		return 0
+	}
+	var total int64
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".glb") {
+			if info, err := e.Info(); err == nil {
+				total += info.Size()
+			}
+		}
+	}
+	return total
+}
+
+func (s *RelayServer) pruneStaleAssemblies() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for h, asm := range s.propAssemblies {
+		if time.Since(asm.CreatedAt) > 30*time.Second {
+			delete(s.propAssemblies, h)
+		}
+	}
+}
+
+func (s *RelayServer) gcUnusedCachedPropsLocked() {
+	cacheDir := filepath.Join(s.worldDir, "prop_cache")
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		return
+	}
+	active := make(map[string]bool, len(s.props))
+	for _, pr := range s.props {
+		active[strings.ToLower(pr.Hash)] = true
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".glb") {
+			continue
+		}
+		h := strings.TrimSuffix(e.Name(), ".glb")
+		if !active[h] {
+			_ = os.Remove(filepath.Join(cacheDir, e.Name()))
+			_ = os.Remove(filepath.Join(cacheDir, e.Name()+".owner"))
+		}
+	}
+}
+
+func (s *RelayServer) requestPropCacheFromClient(cc *ClientConn, pubKey, hash string) {
+	if s.placementMode != "persistent" && s.placementMode != "admin_only" {
+		return
+	}
+	hLower := strings.ToLower(hash)
+	if !isValidHex64(hLower) || s.hasCachedProp(hLower) {
+		return
+	}
+	s.mu.Lock()
+	if _, pending := s.propAssemblies[hLower]; pending {
+		s.mu.Unlock()
+		return
+	}
+	s.propAssemblies[hLower] = &RelayAssetAssembler{
+		FromPub:   pubKey,
+		Chunks:    make(map[int][]byte),
+		CreatedAt: time.Now(),
+	}
+	s.mu.Unlock()
+
+	cc.enqueueJSON(WireMsg{
+		Type:      "REQ_ASSET",
+		TargetPub: pubKey,
+		Hash:      hLower,
+	}, false)
+}
+
+func (s *RelayServer) handleRelayCacheChunk(senderPub string, msg WireMsg) bool {
+	hLower := strings.ToLower(msg.Hash)
+	if !isValidHex64(hLower) || msg.Total <= 0 || msg.Total > 512 || msg.Seq < 0 || msg.Seq >= msg.Total {
+		return false
+	}
+	s.mu.Lock()
+	asm, ok := s.propAssemblies[hLower]
+	if !ok || !strings.EqualFold(asm.FromPub, senderPub) {
+		s.mu.Unlock()
+		return false
+	}
+	if asm.Total == 0 {
+		asm.Total = msg.Total
+	} else if asm.Total != msg.Total {
+		delete(s.propAssemblies, hLower)
+		s.mu.Unlock()
+		return true
+	}
+	raw, err := base64.StdEncoding.DecodeString(msg.Data)
+	if err != nil {
+		s.mu.Unlock()
+		return true
+	}
+	asm.Chunks[msg.Seq] = raw
+	if len(asm.Chunks) < asm.Total {
+		s.mu.Unlock()
+		return true
+	}
+	var full []byte
+	for i := 0; i < asm.Total; i++ {
+		chunk, exists := asm.Chunks[i]
+		if !exists {
+			delete(s.propAssemblies, hLower)
+			s.mu.Unlock()
+			return true
+		}
+		full = append(full, chunk...)
+		if len(full) > MaxCachedPropBytes {
+			delete(s.propAssemblies, hLower)
+			s.mu.Unlock()
+			log.Printf("Rejected oversized prop cache %s (> %d bytes)", hLower[:12], MaxCachedPropBytes)
+			return true
+		}
+	}
+	delete(s.propAssemblies, hLower)
+	s.mu.Unlock()
+
+	// Verify SHA-256 integrity and binary glTF 2.0 header magic ("glTF")
+	if len(full) < 20 || binary.LittleEndian.Uint32(full[0:4]) != 0x46546C67 {
+		log.Printf("Rejected invalid GLB magic for prop cache %s", hLower[:12])
+		return true
+	}
+	if !strings.EqualFold(identity.FileSHA256(full), hLower) {
+		log.Printf("Rejected SHA-256 mismatch for prop cache %s", hLower[:12])
+		return true
+	}
+	if s.propCacheDiskUsage()+int64(len(full)) > MaxTotalPropCacheBytes {
+		log.Printf("Skipped caching prop %s: prop_cache 256MB limit reached", hLower[:12])
+		return true
+	}
+	_ = os.MkdirAll(filepath.Join(s.worldDir, "prop_cache"), 0755)
+	tmpPath := s.propCachePath(hLower) + ".tmp"
+	if err := os.WriteFile(tmpPath, full, 0644); err == nil {
+		if os.Rename(tmpPath, s.propCachePath(hLower)) == nil {
+			_ = os.WriteFile(s.propCachePath(hLower)+".owner", []byte(strings.ToLower(senderPub)+"\n"), 0644)
+			log.Printf("Cached prop %s.glb (%d bytes) in prop_cache/", hLower[:12], len(full))
+		}
+	}
+	return true
+}
+
+func (s *RelayServer) streamCachedPropToPeer(target *ClientConn, hash string) bool {
+	hLower := strings.ToLower(hash)
+	p, ok := s.resolveCachedPropFile(hLower)
+	if !ok {
+		return false
+	}
+	data, err := os.ReadFile(p)
+	if err != nil || len(data) == 0 || len(data) > MaxCachedPropBytes {
+		return false
+	}
+	go func(cc *ClientConn, blob []byte) {
+		const chunkSize = 48 * 1024
+		total := (len(blob) + chunkSize - 1) / chunkSize
+		for i := 0; i < total; i++ {
+			start := i * chunkSize
+			end := start + chunkSize
+			if end > len(blob) {
+				end = len(blob)
+			}
+			cc.enqueueJSON(WireMsg{
+				Type:      "ASSET_CHUNK",
+				TargetPub: cc.pubKey,
+				Hash:      hLower,
+				Seq:       i,
+				Total:     total,
+				Data:      base64.StdEncoding.EncodeToString(blob[start:end]),
+			}, false)
+			time.Sleep(10 * time.Millisecond)
+		}
+	}(target, data)
+	return true
 }
 
 func (s *RelayServer) persistentPropsPath() string {
@@ -868,7 +1091,7 @@ func (s *RelayServer) loadPersistentProps() {
 }
 
 func (s *RelayServer) savePersistentPropsLocked() {
-	if s.placementMode != "persistent" {
+	if s.placementMode != "persistent" && s.placementMode != "admin_only" {
 		return
 	}
 	list := make([]WireMsg, 0, len(s.props))
@@ -1300,7 +1523,18 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if msg.TargetPub != "" {
-				s.sendTo(msg.TargetPub, msg, false)
+				s.mu.RLock()
+				targetOnline := s.clients[msg.TargetPub] != nil
+				s.mu.RUnlock()
+				if targetOnline {
+					s.sendTo(msg.TargetPub, msg, false)
+				} else if !s.streamCachedPropToPeer(cc, msg.Hash) {
+					s.broadcast(auth.PubKey, WireMsg{Type: "REQ_ASSET", PubKey: auth.PubKey, Hash: msg.Hash}, false)
+				}
+			} else {
+				if !s.streamCachedPropToPeer(cc, msg.Hash) {
+					s.broadcast(auth.PubKey, msg, false)
+				}
 			}
 
 		case "ASSET_CHUNK":
@@ -1309,6 +1543,9 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			if s.isItemBlocked(msg.Hash) {
+				continue
+			}
+			if (msg.TargetPub == "" || strings.EqualFold(msg.TargetPub, auth.PubKey)) && s.handleRelayCacheChunk(auth.PubKey, msg) {
 				continue
 			}
 			if msg.TargetPub != "" {
@@ -1321,6 +1558,15 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 			if s.placementMode == "forbid" {
 				s.sendError(cc, "ERR_PLACEMENT_FORBIDDEN", "prop placement is disabled on this world")
 				continue
+			}
+			if s.placementMode == "admin_only" {
+				s.mu.RLock()
+				isAdm := s.adminKeys[pubLower]
+				s.mu.RUnlock()
+				if !isAdm {
+					s.sendError(cc, "ERR_PLACEMENT_ADMIN_ONLY", "prop placement is restricted to world admins")
+					continue
+				}
 			}
 			if !isValidHex64(msg.Hash) || msg.PropID == "" || len(msg.PropID) > 64 || !finiteVec3(msg.Pos) {
 				s.sendError(cc, "ERR_INVALID_PROP", "prop requires valid prop_id, 64-char sha256 hash, and 3D pos")
@@ -1337,10 +1583,19 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 			}
 
 			s.mu.Lock()
-			if s.blockedItems[strings.ToLower(msg.Hash)] || s.blockedItems[msg.Hash] {
+			hLower := strings.ToLower(msg.Hash)
+			if s.blockedItems[hLower] || s.blockedItems[msg.Hash] {
 				s.mu.Unlock()
 				s.sendError(cc, "ERR_BLOCKED_ITEM", "prop asset hash is blocked on this relay")
 				continue
+			}
+			if ownerBytes, err := os.ReadFile(s.propCachePath(hLower) + ".owner"); err == nil {
+				cachedOwner := strings.TrimSpace(string(ownerBytes))
+				if cachedOwner != "" && !strings.EqualFold(cachedOwner, pubLower) && !s.adminKeys[pubLower] {
+					s.mu.Unlock()
+					s.sendError(cc, "ERR_DRM_PROTECTED", "asset is display-protected by world owner")
+					continue
+				}
 			}
 			if existing, exists := s.props[msg.PropID]; exists && existing.PubKey != auth.PubKey {
 				s.mu.Unlock()
@@ -1362,6 +1617,7 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 			s.savePersistentPropsLocked()
 			s.mu.Unlock()
 
+			s.requestPropCacheFromClient(cc, auth.PubKey, msg.Hash)
 			s.broadcast(auth.PubKey, msg, false)
 
 		case "PROP_REMOVE":
@@ -1374,6 +1630,7 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 			if allowDelete {
 				delete(s.props, msg.PropID)
 				s.savePersistentPropsLocked()
+				s.gcUnusedCachedPropsLocked()
 				s.mu.Unlock()
 				s.broadcast("", msg, false)
 			} else {
@@ -1437,6 +1694,7 @@ func (s *RelayServer) handleClearMyProps(cc *ClientConn) {
 	}
 	if len(ids) > 0 {
 		s.savePersistentPropsLocked()
+		s.gcUnusedCachedPropsLocked()
 	}
 	s.mu.Unlock()
 
@@ -1515,6 +1773,7 @@ func (s *RelayServer) handleAdminCommand(cc *ClientConn, cmd string) {
 		}
 		s.props = make(map[string]WireMsg)
 		s.savePersistentPropsLocked()
+		s.gcUnusedCachedPropsLocked()
 		s.mu.Unlock()
 
 		for _, id := range ids {
