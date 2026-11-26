@@ -46,6 +46,15 @@ type WorldPortal struct {
 	Radius float32   `toml:"radius"`
 }
 
+type WorldBakedProp struct {
+	ID    string    `toml:"id"`
+	Hash  string    `toml:"hash"`
+	Owner string    `toml:"owner"`
+	Pos   []float32 `toml:"pos"`
+	Yaw   float32   `toml:"yaw"`
+	Scale float32   `toml:"scale"`
+}
+
 type WorldManifest struct {
 	World struct {
 		Title        string    `toml:"title"`
@@ -64,7 +73,16 @@ type WorldManifest struct {
 		MaxAvatarMB   int    `toml:"max_avatar_mb"`
 		MaxItemMB     int    `toml:"max_item_mb"`
 	} `toml:"rules"`
-	Portals []WorldPortal `toml:"portals"`
+	Portals []WorldPortal    `toml:"portals"`
+	Props   []WorldBakedProp `toml:"props"`
+}
+
+type PortalStatusInfo struct {
+	Checked   bool
+	Online    bool
+	Title     string
+	PeerCount int
+	PropCount int
 }
 
 type WorldDirectory struct {
@@ -74,26 +92,36 @@ type WorldDirectory struct {
 	} `toml:"worlds"`
 }
 
+type OutfitPreset struct {
+	Nick       string `toml:"nick"`
+	AvatarHash string `toml:"avatar_hash"`
+	AvatarName string `toml:"avatar_name"`
+}
+
 type ClientSettings struct {
-	Nick        string  `toml:"nick"`
-	FOV         float32 `toml:"fov"`
-	MouseSens   float32 `toml:"mouse_sens"`
-	VoiceVolume float32 `toml:"voice_volume"`
-	ShowRadar   bool    `toml:"show_radar"`
-	ShowTags    bool    `toml:"show_tags"`
-	ShowCross   bool    `toml:"show_crosshair"`
-	EnableFog   bool    `toml:"enable_fog"`
+	Nick         string                  `toml:"nick"`
+	FOV          float32                 `toml:"fov"`
+	MouseSens    float32                 `toml:"mouse_sens"`
+	VoiceVolume  float32                 `toml:"voice_volume"`
+	ShowRadar    bool                    `toml:"show_radar"`
+	ShowTags     bool                    `toml:"show_tags"`
+	ShowCross    bool                    `toml:"show_crosshair"`
+	EnableFog    bool                    `toml:"enable_fog"`
+	ShowWaypoint bool                    `toml:"show_waypoint"`
+	Outfits      map[string]OutfitPreset `toml:"outfits"`
 }
 
 func defaultClientSettings() ClientSettings {
 	return ClientSettings{
-		FOV:         72.0,
-		MouseSens:   0.0025,
-		VoiceVolume: 1.0,
-		ShowRadar:   true,
-		ShowTags:    true,
-		ShowCross:   true,
-		EnableFog:   true,
+		FOV:          72.0,
+		MouseSens:    0.0025,
+		VoiceVolume:  1.0,
+		ShowRadar:    true,
+		ShowTags:     true,
+		ShowCross:    true,
+		EnableFog:    true,
+		ShowWaypoint: true,
+		Outfits:      make(map[string]OutfitPreset),
 	}
 }
 
@@ -111,6 +139,9 @@ func loadClientSettings(path string) ClientSettings {
 	if cfg.VoiceVolume < 0 || cfg.VoiceVolume > 2.0 {
 		cfg.VoiceVolume = 1.0
 	}
+	if cfg.Outfits == nil {
+		cfg.Outfits = make(map[string]OutfitPreset)
+	}
 	return cfg
 }
 
@@ -124,6 +155,19 @@ func saveClientSettings(path string, cfg ClientSettings) {
 	fmt.Fprintf(&sb, "show_tags = %v\n", cfg.ShowTags)
 	fmt.Fprintf(&sb, "show_crosshair = %v\n", cfg.ShowCross)
 	fmt.Fprintf(&sb, "enable_fog = %v\n", cfg.EnableFog)
+	fmt.Fprintf(&sb, "show_waypoint = %v\n", cfg.ShowWaypoint)
+	if len(cfg.Outfits) > 0 {
+		slots := make([]string, 0, len(cfg.Outfits))
+		for k := range cfg.Outfits {
+			slots = append(slots, k)
+		}
+		sort.Strings(slots)
+		for _, slot := range slots {
+			op := cfg.Outfits[slot]
+			fmt.Fprintf(&sb, "\n[outfits.%q]\nnick = %q\navatar_hash = %q\navatar_name = %q\n",
+				slot, op.Nick, op.AvatarHash, op.AvatarName)
+		}
+	}
 	_ = os.WriteFile(path, []byte(sb.String()), 0644)
 }
 
@@ -217,10 +261,23 @@ type InventoryItem struct {
 	Path      string
 	Hash      string
 	Kind      string
+	SizeBytes int64
+	Bounds    [3]float32
+	HasBounds bool
 	License   *identity.AssetLicense
 	StatusTag string
 	CanSend   bool
 	IsCreator bool
+}
+
+func formatByteSize(b int64) string {
+	if b >= 1024*1024 {
+		return fmt.Sprintf("%.2f MB", float64(b)/(1024.0*1024.0))
+	}
+	if b >= 1024 {
+		return fmt.Sprintf("%.1f KB", float64(b)/1024.0)
+	}
+	return fmt.Sprintf("%d B", b)
 }
 
 type PendingDrop struct {
@@ -249,8 +306,30 @@ type ChatEntry struct {
 
 type ModelAnimSet struct {
 	Anims      []rl.ModelAnimation
+	ClipIdx    int
 	Frame      int32
 	LastUpdate float64
+}
+
+func populateInventoryBounds(items []InventoryItem, models map[string]rl.Model) {
+	for i := range items {
+		if items[i].HasBounds {
+			continue
+		}
+		m, ok := models[items[i].Hash]
+		if !ok || m.MeshCount <= 0 {
+			continue
+		}
+		bb := rl.GetModelBoundingBox(m)
+		w := bb.Max.X - bb.Min.X
+		h := bb.Max.Y - bb.Min.Y
+		d := bb.Max.Z - bb.Min.Z
+		if !math.IsNaN(float64(w)) && !math.IsNaN(float64(h)) && !math.IsNaN(float64(d)) &&
+			!math.IsInf(float64(w), 0) && !math.IsInf(float64(h), 0) && !math.IsInf(float64(d), 0) {
+			items[i].Bounds = [3]float32{w, h, d}
+			items[i].HasBounds = true
+		}
+	}
 }
 
 func modelFeetOffsetY(m rl.Model) float32 {
@@ -361,7 +440,7 @@ func (n *NetState) addChat(line string) {
 		col = rl.NewColor(255, 110, 110, 255)
 	case strings.HasPrefix(line, "[TRANSFER]"):
 		col = rl.Gold
-	case strings.HasPrefix(line, "[WORLD]"), strings.HasPrefix(line, "[PORTAL]"):
+	case strings.HasPrefix(line, "[WORLD]"), strings.HasPrefix(line, "[PORTAL]"), strings.HasPrefix(line, "[MOTD]"), strings.HasPrefix(line, "[RELAY]"):
 		col = rl.SkyBlue
 	case strings.HasPrefix(line, "[SYS]"), strings.HasPrefix(line, "[AVATAR]"),
 		strings.HasPrefix(line, "[INVENTORY]"), strings.HasPrefix(line, "[PROP]"),
@@ -859,6 +938,7 @@ func scanInventoryFolder(folder, kind, cacheDir, localPubKey string, maxBytes in
 			Path:      fullPath,
 			Hash:      h,
 			Kind:      kind,
+			SizeBytes: int64(len(b)),
 			License:   lic,
 			StatusTag: statusTag,
 			CanSend:   canSend,
@@ -1088,11 +1168,15 @@ func applyShaderToModel(m rl.Model, sh rl.Shader, enable bool) {
 		return
 	}
 	mats := unsafe.Slice(m.Materials, m.MaterialCount)
+	var fallback rl.Shader
+	if !enable || sh.ID == 0 {
+		fallback = rl.LoadShader("", "")
+	}
 	for i := range mats {
 		if enable && sh.ID > 0 {
 			mats[i].Shader = sh
 		} else {
-			mats[i].Shader = rl.LoadShader("", "")
+			mats[i].Shader = fallback
 		}
 	}
 }
@@ -1294,6 +1378,75 @@ func main() {
 		pendingRecvFiles: make(map[string]*PendingIncomingFile),
 	}
 
+	seedBakedProps := func(w *LoadedWorld) {
+		if w == nil || w.Manifest == nil {
+			return
+		}
+		var toFetch []string
+		netState.mu.Lock()
+		for idx, bp := range w.Manifest.Props {
+			hLower := strings.ToLower(strings.TrimSpace(bp.Hash))
+			if !isValidHex64(hLower) || !finiteVec3(bp.Pos) {
+				continue
+			}
+			propID := sanitizeDisplayText(strings.TrimSpace(bp.ID), 48)
+			if propID == "" {
+				propID = fmt.Sprintf("baked_%d_%s", idx, hLower[:8])
+			} else if !strings.HasPrefix(propID, "baked_") {
+				propID = "baked_" + propID
+			}
+			scale := bp.Scale
+			if scale <= 0 {
+				scale = 1.0
+			}
+			owner := strings.ToLower(strings.TrimSpace(bp.Owner))
+			if !isValidHex64(owner) {
+				owner = "0000000000000000000000000000000000000000000000000000000000000000"
+			}
+			netState.props[propID] = &WorldProp{
+				PropID: propID,
+				Owner:  owner,
+				Hash:   hLower,
+				Pos:    rl.NewVector3(bp.Pos[0], bp.Pos[1], bp.Pos[2]),
+				Yaw:    bp.Yaw,
+				Scale:  scale,
+			}
+			if ensureAssetQueued(netState, hLower) {
+				toFetch = append(toFetch, hLower)
+			}
+		}
+		netState.mu.Unlock()
+
+		// Also try fetching baked prop .glb files directly over HTTP relative to world.toml if not cached
+		if w.URL != "" && w.URL != "local://sandbox" && len(toFetch) > 0 {
+			parsed, err := url.Parse(w.URL)
+			if err == nil {
+				parsed.Path = filepath.ToSlash(filepath.Dir(parsed.Path)) + "/"
+				baseURL := parsed.String()
+				for _, h := range toFetch {
+					go func(hashHex string) {
+						glbURL := strings.TrimRight(baseURL, "/") + "/" + hashHex + ".glb"
+						b, err := fetchBytes(glbURL, int64(maxItemMB)*1024*1024)
+						if err != nil {
+							return
+						}
+						if !strings.EqualFold(identity.FileSHA256(b), hashHex) {
+							return
+						}
+						if glbguard.ValidateGLB(b, maxItemMB*1024*1024) != nil {
+							return
+						}
+						_ = os.WriteFile(filepath.Join(cacheDir, hashHex+".glb"), b, 0644)
+						netState.mu.Lock()
+						netState.localAssets[hashHex] = b
+						netState.readyModels = append(netState.readyModels, hashHex)
+						netState.mu.Unlock()
+					}(h)
+				}
+			}
+		}
+	}
+
 	startRelayForWorld := func(w *LoadedWorld) {
 		netState.resetSessionForPortal()
 		if w.Manifest.World.RelayURL != "" {
@@ -1304,6 +1457,7 @@ func main() {
 			go runRelayLoop(ctx, w.Manifest.World.RelayURL, kp, netState)
 		}
 	}
+	seedBakedProps(activeWorld)
 	startRelayForWorld(activeWorld)
 
 	rl.SetConfigFlags(rl.FlagWindowResizable | rl.FlagMsaa4xHint)
@@ -1374,6 +1528,8 @@ func main() {
 			}
 		}
 	}
+	populateInventoryBounds(propInv, loadedModels)
+	populateInventoryBounds(avatarInv, loadedModels)
 	defer func() {
 		for h, m := range loadedModels {
 			unloadModelAndAnims(m, loadedAnims[h])
@@ -1397,8 +1553,13 @@ func main() {
 
 	velY := float32(0.0)
 	lastPortalHop := time.Time{}
-	hopToWorld := func(targetURL string) {
+	ghostActive := false
+	var ownedPropIDs []string
+	visitedWorlds := []string{activeWorld.URL}
+	var hopToWorld func(targetURL string, recordHistory bool)
+	hopToWorld = func(targetURL string, recordHistory bool) {
 		targetURL = normalizeWorldURL(targetURL)
+		prevURL := activeWorld.URL
 		netState.addChat("[PORTAL]: Loading " + targetURL + " ...")
 		nextW, err := loadWorldFromURL(targetURL, cacheDir)
 		if err != nil {
@@ -1410,6 +1571,22 @@ func main() {
 			activeWorld.Sandbox.Close()
 		}
 		activeWorld = nextW
+		if activeWorld.Manifest.Rules.MaxAvatarMB > 0 {
+			maxAvMB = activeWorld.Manifest.Rules.MaxAvatarMB
+		} else {
+			maxAvMB = 15
+		}
+		if activeWorld.Manifest.Rules.MaxItemMB > 0 {
+			maxItemMB = activeWorld.Manifest.Rules.MaxItemMB
+		} else {
+			maxItemMB = 5
+		}
+		netState.mu.Lock()
+		netState.maxAssetB = maxAvMB * 1024 * 1024
+		netState.mu.Unlock()
+		ghostActive = false
+		ownedPropIDs = nil
+
 		worldModel, worldAnims = loadModelWithAnims(activeWorld.EnvCacheGLB, fogShader, cfg.EnableFog)
 		rl.SetWindowTitle("VektorWeb - " + activeWorld.Manifest.World.Title)
 
@@ -1423,12 +1600,89 @@ func main() {
 		cam.Target = rl.NewVector3(spawn.X, spawn.Y, spawn.Z-1.0)
 		velY = 0
 		lastPortalHop = time.Now()
+		if recordHistory && prevURL != "" && normalizeWorldURL(prevURL) != activeWorld.URL {
+			if len(visitedWorlds) == 0 || normalizeWorldURL(visitedWorlds[len(visitedWorlds)-1]) != normalizeWorldURL(prevURL) {
+				visitedWorlds = append(visitedWorlds, prevURL)
+				if len(visitedWorlds) > 16 {
+					visitedWorlds = visitedWorlds[len(visitedWorlds)-16:]
+				}
+			}
+		}
+		seedBakedProps(activeWorld)
 		startRelayForWorld(activeWorld)
 		netState.addChat("[PORTAL]: Arrived at " + activeWorld.Manifest.World.Title)
 	}
 
 	chatActive := false
 	dirOpen := false
+	var dirStatusMu sync.RWMutex
+	dirStatuses := make(map[string]PortalStatusInfo)
+	refreshPortalStatuses := func(dir WorldDirectory) {
+		for _, w := range dir.Worlds {
+			rawU := strings.TrimSpace(w.URL)
+			if rawU == "" {
+				continue
+			}
+			normU := normalizeWorldURL(rawU)
+			if normU == "local://sandbox" {
+				dirStatusMu.Lock()
+				dirStatuses[rawU] = PortalStatusInfo{
+					Checked: true,
+					Online:  true,
+					Title:   "Offline Sandbox",
+				}
+				dirStatusMu.Unlock()
+				continue
+			}
+			dirStatusMu.Lock()
+			dirStatuses[rawU] = PortalStatusInfo{Checked: false}
+			dirStatusMu.Unlock()
+
+			go func(origURL, httpWorldURL string) {
+				u, err := url.Parse(httpWorldURL)
+				if err != nil {
+					return
+				}
+				u.Path = "/status.json"
+				u.RawQuery = ""
+				httpClient := &http.Client{Timeout: 4 * time.Second}
+				resp, err := httpClient.Get(u.String())
+				if err != nil {
+					dirStatusMu.Lock()
+					dirStatuses[origURL] = PortalStatusInfo{Checked: true, Online: false}
+					dirStatusMu.Unlock()
+					return
+				}
+				defer resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					dirStatusMu.Lock()
+					dirStatuses[origURL] = PortalStatusInfo{Checked: true, Online: false}
+					dirStatusMu.Unlock()
+					return
+				}
+				var st struct {
+					Title  string `json:"title"`
+					Online int    `json:"online"`
+					Props  int    `json:"props"`
+				}
+				if err := json.NewDecoder(io.LimitReader(resp.Body, 32*1024)).Decode(&st); err != nil {
+					dirStatusMu.Lock()
+					dirStatuses[origURL] = PortalStatusInfo{Checked: true, Online: false}
+					dirStatusMu.Unlock()
+					return
+				}
+				dirStatusMu.Lock()
+				dirStatuses[origURL] = PortalStatusInfo{
+					Checked:   true,
+					Online:    true,
+					Title:     sanitizeDisplayText(st.Title, 40),
+					PeerCount: st.Online,
+					PropCount: st.Props,
+				}
+				dirStatusMu.Unlock()
+			}(rawU, normU)
+		}
+	}
 	helpOpen := false
 	invOpen := false
 	settingsOpen := false
@@ -1447,11 +1701,12 @@ func main() {
 	thirdPerson := false
 	thirdPersonDist := float32(3.6)
 	grounded := false
-	ghostActive := false
 	snapToGrid := false
 	ghostYawOffset := float32(0)
 	ghostYOffset := float32(0)
 	ghostScale := float32(1.0)
+	showRangeRing := false
+	dirCursor := 0
 	var pendingDrop *PendingDrop
 
 	chatInput := ""
@@ -1461,7 +1716,6 @@ func main() {
 	luaHUD := ""
 	lastSync := time.Now()
 	lastJanitor := time.Now()
-	var ownedPropIDs []string
 
 	rl.SetExitKey(0)
 	cursorLocked := true
@@ -1531,7 +1785,12 @@ func main() {
 			if animSet == nil || len(animSet.Anims) == 0 {
 				return
 			}
-			anim := animSet.Anims[0]
+			idx := animSet.ClipIdx
+			if idx < 0 || idx >= len(animSet.Anims) {
+				idx = 0
+				animSet.ClipIdx = 0
+			}
+			anim := animSet.Anims[idx]
 			if anim.KeyframeCount <= 0 {
 				return
 			}
@@ -1730,7 +1989,7 @@ func main() {
 					cam.Target = rl.Vector3Add(cam.Position, offset)
 				case "PORTAL":
 					if act.WorldURL != "" && normalizeWorldURL(act.WorldURL) != activeWorld.URL {
-						hopToWorld(act.WorldURL)
+						hopToWorld(act.WorldURL, true)
 					}
 				}
 			}
@@ -1818,18 +2077,42 @@ func main() {
 				if invOpen {
 					avatarInv = scanInventoryFolder(avatarsDir, "avatar", cacheDir, kp.PubHex(), maxAvMB*1024*1024, localAssets)
 					propInv = scanInventoryFolder(itemsDir, "prop", cacheDir, kp.PubHex(), maxItemMB*1024*1024, localAssets)
+					for _, it := range propInv {
+						if _, ok := loadedModels[it.Hash]; !ok {
+							m, a := loadModelWithAnims(filepath.Join(cacheDir, it.Hash+".glb"), fogShader, cfg.EnableFog)
+							loadedModels[it.Hash] = m
+							if a != nil {
+								loadedAnims[it.Hash] = a
+							}
+						}
+					}
+					for _, it := range avatarInv {
+						if _, ok := loadedModels[it.Hash]; !ok {
+							m, a := loadModelWithAnims(filepath.Join(cacheDir, it.Hash+".glb"), fogShader, cfg.EnableFog)
+							loadedModels[it.Hash] = m
+							if a != nil {
+								loadedAnims[it.Hash] = a
+							}
+						}
+					}
+					populateInventoryBounds(propInv, loadedModels)
+					populateInventoryBounds(avatarInv, loadedModels)
 					invCursor = 0
 				}
 			}
 			if rl.IsKeyPressed(rl.KeyTab) {
 				dirOpen = !dirOpen
 				invOpen, transferModalOpen, helpOpen, settingsOpen, peersOpen = false, false, false, false, false
+				if dirOpen {
+					dirCursor = 0
+					refreshPortalStatuses(directory)
+				}
 			}
 		}
 
 		forward := rl.Vector3Normalize(rl.Vector3Subtract(cam.Target, cam.Position))
 		ghostPos := rl.Vector3Add(playerHeadPos, rl.Vector3Scale(forward, 3.2))
-		ghostPos.Y = ghostYOffset
+		ghostPos.Y = (playerHeadPos.Y - 1.65) + ghostYOffset
 		ghostYaw := float32(math.Atan2(float64(forward.X), float64(forward.Z))*(180.0/math.Pi)) + ghostYawOffset
 
 		if snapToGrid {
@@ -2115,6 +2398,36 @@ func main() {
 						invCursor = (invCursor - 1 + len(activeList)) % len(activeList)
 					}
 				}
+				if rl.IsKeyPressed(rl.KeyD) && len(activeList) > 0 {
+					chosen := activeList[invCursor%len(activeList)]
+					if chosen.Path == defaultAvPath || chosen.Path == defaultPropPath {
+						netState.addChat("[INVENTORY]: Cannot delete built-in default " + chosen.Name)
+					} else if chosen.Path != "" {
+						_ = os.Remove(chosen.Path)
+						_ = os.Remove(licensePathForGLB(chosen.Path))
+						if invTab == "avatar" {
+							if chosen.Hash == localAvHash {
+								if b, err := os.ReadFile(defaultAvPath); err == nil {
+									h := identity.FileSHA256(b)
+									localAvHash = h
+									netState.mu.Lock()
+									netState.localAvHash = h
+									netState.localAvBytes = b
+									netState.mu.Unlock()
+								}
+							}
+							avatarInv = scanInventoryFolder(avatarsDir, "avatar", cacheDir, kp.PubHex(), maxAvMB*1024*1024, localAssets)
+							populateInventoryBounds(avatarInv, loadedModels)
+						} else {
+							propInv = scanInventoryFolder(itemsDir, "prop", cacheDir, kp.PubHex(), maxItemMB*1024*1024, localAssets)
+							populateInventoryBounds(propInv, loadedModels)
+						}
+						if invCursor > 0 {
+							invCursor--
+						}
+						netState.addChat("[INVENTORY]: Deleted local item " + chosen.Name)
+					}
+				}
 				if rl.IsKeyPressed(rl.KeyR) && len(activeList) > 0 {
 					chosen := activeList[invCursor%len(activeList)]
 					if !chosen.CanSend {
@@ -2159,12 +2472,48 @@ func main() {
 				}
 			}
 		} else if dirOpen {
-			for i := 0; i < len(directory.Worlds) && i < 9; i++ {
+			visDirCount := len(directory.Worlds)
+			if visDirCount > 8 {
+				visDirCount = 8
+			}
+			if rl.IsKeyPressed(rl.KeyDown) || rl.IsKeyPressed(rl.KeyS) {
+				if visDirCount > 0 {
+					dirCursor = (dirCursor + 1) % visDirCount
+				}
+			}
+			if rl.IsKeyPressed(rl.KeyUp) || rl.IsKeyPressed(rl.KeyW) {
+				if visDirCount > 0 {
+					dirCursor = (dirCursor - 1 + visDirCount) % visDirCount
+				}
+			}
+			if rl.IsKeyPressed(rl.KeyEnter) && visDirCount > 0 {
+				idx := dirCursor % visDirCount
+				dirOpen = false
+				hopToWorld(directory.Worlds[idx].URL, true)
+			}
+			if rl.IsKeyPressed(rl.KeyF) && visDirCount > 0 {
+				idx := dirCursor % visDirCount
+				if idx > 0 {
+					pinned := directory.Worlds[idx]
+					copy(directory.Worlds[1:idx+1], directory.Worlds[0:idx])
+					directory.Worlds[0] = pinned
+					dirCursor = 0
+					if err := saveWorldDirectory(dirPath, directory); err == nil {
+						netState.addChat(fmt.Sprintf("[DIRECTORY]: Pinned %q to slot [1]", pinned.Name))
+					}
+				} else {
+					netState.addChat(fmt.Sprintf("[DIRECTORY]: %q is already pinned at slot [1]", directory.Worlds[0].Name))
+				}
+			}
+			for i := 0; i < visDirCount; i++ {
 				if rl.IsKeyPressed(int32(rl.KeyOne + i)) {
 					dirOpen = false
-					hopToWorld(directory.Worlds[i].URL)
+					hopToWorld(directory.Worlds[i].URL, true)
 					break
 				}
+			}
+			if rl.IsKeyPressed(rl.KeyR) {
+				refreshPortalStatuses(directory)
 			}
 			if rl.IsKeyPressed(rl.KeyEscape) {
 				dirOpen = false
@@ -2238,6 +2587,11 @@ func main() {
 						netState.mu.Lock()
 						delete(netState.props, lookedAt.ID)
 						netState.mu.Unlock()
+						for i := len(ownedPropIDs) - 1; i >= 0; i-- {
+							if ownedPropIDs[i] == lookedAt.ID {
+								ownedPropIDs = append(ownedPropIDs[:i], ownedPropIDs[i+1:]...)
+							}
+						}
 						_ = netState.sendJSON(WireMsg{Type: "PROP_REMOVE", PropID: lookedAt.ID})
 						netState.addChat("[PROP]: Removed " + lookedAt.Label)
 					} else if lookedAt.Kind == "peer" && !ghostActive && rl.IsKeyPressed(rl.KeyE) {
@@ -2286,6 +2640,28 @@ func main() {
 				}
 				if rl.IsKeyPressed(rl.KeyN) && len(propInv) > 1 {
 					propIdx = (propIdx + 1) % len(propInv)
+				}
+				for clipKey := 0; clipKey < 9; clipKey++ {
+					if rl.IsKeyPressed(int32(rl.KeyOne + clipKey)) {
+						if animSet, ok := loadedAnims[localAvHash]; ok && len(animSet.Anims) > 0 {
+							if clipKey < len(animSet.Anims) {
+								animSet.ClipIdx = clipKey
+								animSet.Frame = 0
+								netState.addChat(fmt.Sprintf("[ANIM]: Avatar clip %d/%d", clipKey+1, len(animSet.Anims)))
+							} else {
+								netState.addChat(fmt.Sprintf("[ANIM]: Avatar only has %d animation clip(s)", len(animSet.Anims)))
+							}
+						}
+					}
+				}
+				if rl.IsKeyPressed(rl.KeyH) {
+					cfg.ShowWaypoint = !cfg.ShowWaypoint
+					saveClientSettings(settingsPath, cfg)
+					if cfg.ShowWaypoint {
+						netState.addChat("[HUD]: Spawn waypoint marker ON")
+					} else {
+						netState.addChat("[HUD]: Spawn waypoint marker OFF")
+					}
 				}
 				if rl.IsKeyPressed(rl.KeyM) {
 					netState.mu.Lock()
@@ -2369,12 +2745,22 @@ func main() {
 				}
 
 				if rl.IsKeyPressed(rl.KeyX) && len(ownedPropIDs) > 0 {
-					lastID := ownedPropIDs[len(ownedPropIDs)-1]
-					ownedPropIDs = ownedPropIDs[:len(ownedPropIDs)-1]
 					netState.mu.Lock()
-					delete(netState.props, lastID)
+					var lastID string
+					for len(ownedPropIDs) > 0 {
+						cand := ownedPropIDs[len(ownedPropIDs)-1]
+						ownedPropIDs = ownedPropIDs[:len(ownedPropIDs)-1]
+						if _, exists := netState.props[cand]; exists {
+							lastID = cand
+							delete(netState.props, cand)
+							break
+						}
+					}
 					netState.mu.Unlock()
-					_ = netState.sendJSON(WireMsg{Type: "PROP_REMOVE", PropID: lastID})
+					if lastID != "" {
+						_ = netState.sendJSON(WireMsg{Type: "PROP_REMOVE", PropID: lastID})
+						netState.addChat("[PROP]: Undid prop " + lastID[:minInt(6, len(lastID))])
+					}
 				}
 
 				pttMu.Lock()
@@ -2435,7 +2821,7 @@ func main() {
 							chatHistory = chatHistory[len(chatHistory)-25:]
 						}
 					}
-					handleChatCommand(chatInput, kp, netState, hopToWorld, &avatarInv, &propInv, &localAvHash, exportsDir, &spawn, playerHeadPos, activeWorld.URL, activeWorld.Manifest.World.Title, worldModel, &cfg, settingsPath, &directory, dirPath)
+					handleChatCommand(chatInput, kp, netState, hopToWorld, &visitedWorlds, &showRangeRing, &avatarInv, &propInv, &localAvHash, exportsDir, &spawn, playerHeadPos, activeWorld.URL, activeWorld.Manifest.World.Title, worldModel, &cfg, settingsPath, &directory, dirPath)
 					chatInput = ""
 				}
 				chatHistIdx = len(chatHistory)
@@ -2471,7 +2857,7 @@ func main() {
 				}
 				pCenter := rl.NewVector3(portal.Pos[0], portal.Pos[1], portal.Pos[2])
 				if rl.Vector3Distance(bodyHeadPos, pCenter) <= rad {
-					hopToWorld(portal.URL)
+					hopToWorld(portal.URL, true)
 					break
 				}
 			}
@@ -2531,10 +2917,19 @@ func main() {
 				sp := rl.GetWorldToScreen(rl.NewVector3(pPos.X, pPos.Y+2.9, pPos.Z), cam)
 				screenLabels = append(screenLabels, screenLabel{
 					screenPos: sp,
-					label:     "PORTAL: " + sanitizeDisplayText(labelName, 32),
+					label:     fmt.Sprintf("PORTAL: %s (%.1fm)", sanitizeDisplayText(labelName, 28), dist),
 					isPortal:  true,
 				})
 			}
+		}
+
+		if (rl.IsKeyDown(rl.KeyV) && !chatActive) || showRangeRing {
+			ringPos := rl.NewVector3(bodyHeadPos.X, bodyHeadPos.Y-1.62, bodyHeadPos.Z)
+			ringCol := rl.Fade(rl.SkyBlue, 0.45)
+			if rl.IsKeyDown(rl.KeyV) && !chatActive {
+				ringCol = rl.Fade(rl.Lime, 0.65)
+			}
+			rl.DrawCircle3D(ringPos, 35.0, rl.NewVector3(1, 0, 0), 90, ringCol)
 		}
 
 		if thirdPerson && walkMode {
@@ -2622,6 +3017,19 @@ func main() {
 			}
 		}
 		netState.mu.RUnlock()
+
+		if cfg.ShowWaypoint {
+			toSpawn := rl.Vector3Subtract(spawn, cam.Position)
+			spawnDist := rl.Vector3Length(toSpawn)
+			if spawnDist > 6.0 && rl.Vector3DotProduct(lookVec, toSpawn) > 0 {
+				sp := rl.GetWorldToScreen(rl.NewVector3(spawn.X, spawn.Y+0.8, spawn.Z), cam)
+				screenLabels = append(screenLabels, screenLabel{
+					screenPos: sp,
+					label:     fmt.Sprintf("SPAWN (%.0fm)", spawnDist),
+					isPortal:  true,
+				})
+			}
+		}
 		rl.EndMode3D()
 
 		for _, sl := range screenLabels {
@@ -2784,7 +3192,7 @@ func main() {
 		}
 
 		if cfg.ShowRadar {
-			drawMiniRadar(sw-84, 112, 64, cam, lookVec, netState)
+			drawMiniRadar(sw-84, 112, 64, cam, lookVec, netState, activeWorld.Manifest.Portals)
 		}
 
 		// Active P2P .glb download progress bar(s) below radar
@@ -2968,7 +3376,7 @@ func main() {
 					rl.DrawText("No .glb files found. Drag & drop a .glb onto the window!", mx+24, my+98, 17, rl.LightGray)
 				} else {
 					for i, item := range activeList {
-						if i >= 9 {
+						if i >= 8 {
 							break
 						}
 						prefix := "   "
@@ -2981,10 +3389,15 @@ func main() {
 						if invTab == "avatar" && item.Hash == localAvHash {
 							equipped = " [EQUIPPED]"
 						}
-						rl.DrawText(fmt.Sprintf("%s%s (%s...)%s%s", prefix, item.Name, item.Hash[:8], item.StatusTag, equipped), mx+24, my+int32(90+i*28), 16, col)
+						meta := formatByteSize(item.SizeBytes)
+						if item.HasBounds {
+							meta += fmt.Sprintf(" | %.2fx%.2fx%.2fm", item.Bounds[0], item.Bounds[1], item.Bounds[2])
+						}
+						rowTxt := fmt.Sprintf("%s%s (%s) [%s]%s%s", prefix, item.Name, item.Hash[:6], meta, item.StatusTag, equipped)
+						rl.DrawText(truncateToWidth(rowTxt, 15, mw-48), mx+24, my+int32(88+i*32), 15, col)
 					}
 				}
-				rl.DrawText("[Up/Down] Select | [Enter] Equip/Arm | [R] Transfer/Sell to Peer | [I/Esc] Close", mx+24, my+mh-34, 15, rl.Gray)
+				rl.DrawText("[Up/Dn] Select | [Enter] Equip/Arm | [R] Transfer | [D] Delete | [I/Esc] Close", mx+24, my+mh-34, 15, rl.Gray)
 			}
 		}
 
@@ -3093,19 +3506,66 @@ func main() {
 		}
 
 		if dirOpen {
-			mw, mh := int32(620), int32(360)
+			mw, mh := int32(720), int32(430)
 			mx, my := (sw-mw)/2, (sh-mh)/2
-			rl.DrawRectangle(mx, my, mw, mh, rl.NewColor(16, 20, 30, 245))
+			rl.DrawRectangle(mx, my, mw, mh, rl.NewColor(16, 20, 30, 248))
 			rl.DrawRectangleLines(mx, my, mw, mh, rl.SkyBlue)
-			rl.DrawText("WORLD DIRECTORY (~/.vektorweb-client/worlds.toml)", mx+24, my+20, 19, rl.SkyBlue)
+			rl.DrawText("WORLD DIRECTORY (~/.vektorweb-client/worlds.toml)", mx+24, my+18, 19, rl.SkyBlue)
+
+			dirStatusMu.RLock()
 			for i, w := range directory.Worlds {
-				if i >= 9 {
+				if i >= 8 {
 					break
 				}
-				rl.DrawText(fmt.Sprintf("[%d] %s", i+1, w.Name), mx+24, my+int32(58+i*30), 18, rl.RayWhite)
-				rl.DrawText(w.URL, mx+54, my+int32(76+i*30), 14, rl.Gray)
+				rowY := my + int32(56+i*40)
+				st, hasSt := dirStatuses[strings.TrimSpace(w.URL)]
+
+				badgeTxt := "[CHECKING...]"
+				badgeCol := rl.Gray
+				dotCol := rl.Gray
+				titleDisplay := w.Name
+				if hasSt && st.Checked {
+					if st.Online {
+						dotCol = rl.Lime
+						badgeCol = rl.Lime
+						if normalizeWorldURL(w.URL) == "local://sandbox" {
+							badgeTxt = "[LOCAL SANDBOX]"
+						} else {
+							badgeTxt = fmt.Sprintf("[ONLINE | %d online | %d props]", st.PeerCount, st.PropCount)
+							if st.Title != "" && (titleDisplay == "" || titleDisplay == "Local Relay World") {
+								titleDisplay = st.Title
+							}
+						}
+					} else {
+						dotCol = rl.Red
+						badgeCol = rl.NewColor(255, 110, 110, 255)
+						badgeTxt = "[OFFLINE]"
+					}
+				}
+
+				isSel := (i == dirCursor)
+				if isSel {
+					rl.DrawRectangle(mx+18, rowY-3, mw-36, 37, rl.NewColor(26, 36, 54, 210))
+				}
+				rl.DrawCircle(mx+30, rowY+9, 4, dotCol)
+				pinTag := ""
+				if i == 0 {
+					pinTag = " [PINNED]"
+				}
+				leftTitle := fmt.Sprintf("[%d] %s%s", i+1, sanitizeDisplayText(titleDisplay, 28), pinTag)
+				titleCol := rl.RayWhite
+				if isSel {
+					titleCol = rl.Gold
+				}
+				rl.DrawText(leftTitle, mx+42, rowY, 17, titleCol)
+
+				bw := rl.MeasureText(badgeTxt, 15)
+				rl.DrawText(badgeTxt, mx+mw-24-bw, rowY+2, 15, badgeCol)
+				rl.DrawText(truncateToWidth(w.URL, 14, mw-70), mx+42, rowY+19, 14, rl.Gray)
 			}
-			rl.DrawText("Press [1-9] to hop portal or [Tab / Esc] to close", mx+24, my+mh-34, 16, rl.Gold)
+			dirStatusMu.RUnlock()
+
+			rl.DrawText("[1-8 / Enter] Hop  |  [F] Pin to #1  |  [R] Refresh  |  [Tab / Esc] Close", mx+24, my+mh-34, 15, rl.Gold)
 		}
 
 		if helpOpen {
@@ -3120,7 +3580,7 @@ func main() {
 				"WASD + Mouse     : Walk / Look ([Shift] Sprint, [Space] Jump, [F] Walk/Fly)",
 				"[C] / [R]        : Toggle 3rd-Person View (Wheel zooms) / Return to Spawn",
 				"Look-At Target   : [Del] Remove your prop | [E] Offer trade to peer",
-				"[T] or [/]       : Chat (/help, /clear, /nick, /bookmark, /copykey, /setspawn, /mint)",
+				"[T] or [/]       : Chat (/help, /me, /outfit, /clearmyprops, /exportworld, /nick, /bookmark)",
 				"[V] / [M]        : Hold Push-to-Talk voice (35m) / Mute incoming voice",
 				"[G]/[Esc] [B] [N]: Toggle/Exit Build Mode / Snap-to-Grid / Next prop ([F4] Set Spawn)",
 				"[Q]/[E] [PgUp/Dn]: Rotate & nudge prop height ([+/-] scale, [P]/[X] place/undo)",
@@ -3151,6 +3611,45 @@ func clampFloat32(v, minV, maxV float32) float32 {
 		return maxV
 	}
 	return v
+}
+
+func setClipboardSafe(text string) bool {
+	rl.SetClipboardText(text)
+	// Verify if GLFW/raylib actually retained the text
+	if got := rl.GetClipboardText(); got == text {
+		return true
+	}
+	// Fallback to native OS clipboard utilities (Wayland, X11, macOS, Windows)
+	var candidates [][]string
+	switch runtime.GOOS {
+	case "windows":
+		candidates = [][]string{{"cmd", "/c", "clip"}}
+	case "darwin":
+		candidates = [][]string{{"pbcopy"}}
+	default:
+		if os.Getenv("WAYLAND_DISPLAY") != "" {
+			candidates = append(candidates, []string{"wl-copy"})
+		}
+		candidates = append(candidates,
+			[]string{"xclip", "-selection", "clipboard"},
+			[]string{"xsel", "--clipboard", "--input"},
+			[]string{"wl-copy"},
+		)
+	}
+	for _, args := range candidates {
+		bin, err := exec.LookPath(args[0])
+		if err != nil {
+			continue
+		}
+		cmd := exec.Command(bin, args[1:]...)
+		cmd.Stdin = strings.NewReader(text)
+		if err := cmd.Start(); err == nil {
+			// Reap child in background (xclip/wl-copy stay alive to serve X11/Wayland paste requests)
+			go func() { _ = cmd.Wait() }()
+			return true
+		}
+	}
+	return false
 }
 
 func sanitizeFileName(raw string) string {
@@ -3250,13 +3749,28 @@ func fitInputTail(prefix, input, suffix string, fontSize, maxWidth int32) string
 	return prefix + suffix
 }
 
-func drawMiniRadar(cx, cy, radius int32, cam rl.Camera3D, lookVec rl.Vector3, ns *NetState) {
+func drawMiniRadar(cx, cy, radius int32, cam rl.Camera3D, lookVec rl.Vector3, ns *NetState, portals []WorldPortal) {
 	rl.DrawCircle(cx, cy, float32(radius), rl.NewColor(14, 18, 28, 210))
 	rl.DrawCircleLines(cx, cy, float32(radius), rl.NewColor(65, 85, 115, 220))
 	rl.DrawCircle(cx, cy, 3, rl.Lime)
 
 	flatLook := rl.Vector3Normalize(rl.NewVector3(lookVec.X, 0, lookVec.Z))
 	rl.DrawLine(cx, cy, cx+int32(flatLook.X*14), cy+int32(flatLook.Z*14), rl.Lime)
+
+	for _, portal := range portals {
+		if len(portal.Pos) != 3 {
+			continue
+		}
+		dx := (portal.Pos[0] - cam.Position.X) * 1.5
+		dz := (portal.Pos[2] - cam.Position.Z) * 1.5
+		dist := float32(math.Sqrt(float64(dx*dx + dz*dz)))
+		if dist > float32(radius-5) {
+			scale := float32(radius-5) / dist
+			dx *= scale
+			dz *= scale
+		}
+		rl.DrawCircleLines(cx+int32(dx), cy+int32(dz), 4.0, rl.NewColor(110, 220, 255, 230))
+	}
 
 	ns.mu.RLock()
 	defer ns.mu.RUnlock()
@@ -3284,7 +3798,9 @@ func handleChatCommand(
 	input string,
 	kp *identity.Keypair,
 	ns *NetState,
-	hopFn func(string),
+	hopFn func(string, bool),
+	visitedWorlds *[]string,
+	showRangeRing *bool,
 	avatarInv *[]InventoryItem,
 	propInv *[]InventoryItem,
 	localAvHash *string,
@@ -3299,18 +3815,77 @@ func handleChatCommand(
 	directory *WorldDirectory,
 	dirPath string,
 ) {
+	input = strings.TrimSpace(input)
 	if input == "/help" || input == "/?" || strings.HasPrefix(input, "/help ") {
-		ns.addChat("[HELP]: Commands: /help, /clear, /nick <name>, /say <msg>, /w <peer> <msg>, /portal <url>, /bookmark [name], /setspawn [x y z], /pubkey, /copykey, /mint <pub> <lock|free>, /chatlog")
-		ns.addChat("[HELP]: Keys: [F1] Full Help | [I] Inventory | [G]/[Esc] Build Mode | [C] 3rd-Person | [F] Walk/Fly | [R] Spawn | [V] Voice | [Up/Dn] Chat History")
+		ns.addChat("[HELP]: Commands: /help, /clear, /range, /back, /history, /clearmyprops, /exportworld, /me <act>, /outfit, /nick, /say, /w, /portal, /bookmark, /setspawn, /copykey")
+		ns.addChat("[HELP]: Keys: [F1] Full Help | [I] Inventory | [G]/[Esc] Build | [C] 3P | [F] Walk/Fly | [H] Waypoint | [1-9] Anim Clip | [R] Spawn | [V] Voice")
+		return
+	}
+	if input == "/range" {
+		if showRangeRing != nil {
+			*showRangeRing = !*showRangeRing
+			if *showRangeRing {
+				ns.addChat("[HUD]: 35m spatial voice & /say proximity ring ON")
+			} else {
+				ns.addChat("[HUD]: 35m spatial voice & /say proximity ring OFF")
+			}
+		}
+		return
+	}
+	if input == "/history" {
+		if visitedWorlds == nil || len(*visitedWorlds) <= 1 {
+			ns.addChat("[HISTORY]: Only current world visited this session: " + activeWorldURL)
+			return
+		}
+		for i, u := range *visitedWorlds {
+			ns.addChat(fmt.Sprintf("[HISTORY %d]: %s", i+1, u))
+		}
+		return
+	}
+	if input == "/back" {
+		if visitedWorlds == nil || len(*visitedWorlds) <= 1 {
+			ns.addChat("[PORTAL]: No previous world in session history.")
+			return
+		}
+		prev := (*visitedWorlds)[len(*visitedWorlds)-1]
+		*visitedWorlds = (*visitedWorlds)[:len(*visitedWorlds)-1]
+		hopFn(prev, false)
 		return
 	}
 	if input == "/clear" {
 		ns.clearChat()
 		return
 	}
+	if input == "/clearmyprops" {
+		myPub := kp.PubHex()
+		ns.mu.Lock()
+		var removedIDs []string
+		for id, pr := range ns.props {
+			if strings.EqualFold(pr.Owner, myPub) {
+				removedIDs = append(removedIDs, id)
+				delete(ns.props, id)
+			}
+		}
+		ns.mu.Unlock()
+
+		for _, id := range removedIDs {
+			_ = ns.sendJSON(WireMsg{Type: "PROP_REMOVE", PropID: id})
+		}
+		_ = ns.sendJSON(WireMsg{Type: "CHAT", Channel: "global", Text: "/clearmyprops"})
+		ns.addChat(fmt.Sprintf("[PROP]: Cleared %d of your placed props.", len(removedIDs)))
+		return
+	}
 	if input == "/copykey" {
-		rl.SetClipboardText(kp.PubHex())
-		ns.addChat("[PUBKEY]: Copied " + kp.PubHex()[:16] + "... to clipboard!")
+		pub := kp.PubHex()
+		ok := setClipboardSafe(pub)
+		if ok {
+			ns.addChat("[PUBKEY]: Copied full 64-char key to clipboard: " + pub)
+		} else {
+			keyTxtPath := filepath.Join(exportsDir, "my_pubkey.txt")
+			_ = os.WriteFile(keyTxtPath, []byte(pub+"\n"), 0644)
+			ns.addChat("[PUBKEY]: " + pub)
+			ns.addChat("[PUBKEY]: Clipboard unavailable — saved full key to exports/my_pubkey.txt")
+		}
 		return
 	}
 	if input == "/bookmark" || strings.HasPrefix(input, "/bookmark ") {
@@ -3377,6 +3952,66 @@ func handleChatCommand(
 		log.Printf("Your Ed25519 Public Key: %s", kp.PubHex())
 		return
 	}
+	if input == "/exportworld" {
+		ns.mu.RLock()
+		type snapProp struct {
+			id    string
+			hash  string
+			owner string
+			pos   rl.Vector3
+			yaw   float32
+			scale float32
+		}
+		var list []snapProp
+		for _, pr := range ns.props {
+			list = append(list, snapProp{
+				id:    pr.PropID,
+				hash:  pr.Hash,
+				owner: pr.Owner,
+				pos:   pr.Pos,
+				yaw:   pr.Yaw,
+				scale: pr.Scale,
+			})
+		}
+		ns.mu.RUnlock()
+
+		sort.Slice(list, func(i, j int) bool { return list[i].id < list[j].id })
+
+		var sb strings.Builder
+		fmt.Fprintf(&sb, "# VektorWeb World Prop Snapshot (%s)\n", time.Now().UTC().Format(time.RFC3339))
+		fmt.Fprintf(&sb, "# World: %s (%s)\n", activeWorldTitle, activeWorldURL)
+		fmt.Fprintf(&sb, "# Paste these [[props]] blocks into your server's world.toml and reload (SIGUSR1).\n\n")
+		for _, sp := range list {
+			s := sp.scale
+			if s <= 0 {
+				s = 1.0
+			}
+			fmt.Fprintf(&sb, "[[props]]\n")
+			fmt.Fprintf(&sb, "id = %q\n", sp.id)
+			fmt.Fprintf(&sb, "hash = %q\n", sp.hash)
+			fmt.Fprintf(&sb, "owner = %q\n", sp.owner)
+			fmt.Fprintf(&sb, "pos = [%.3f, %.3f, %.3f]\n", sp.pos.X, sp.pos.Y, sp.pos.Z)
+			fmt.Fprintf(&sb, "yaw = %.2f\n", sp.yaw)
+			fmt.Fprintf(&sb, "scale = %.2f\n\n", s)
+		}
+
+		fname := fmt.Sprintf("world_snapshot_%s.toml", time.Now().Format("20060102_150405"))
+		outPath := filepath.Join(exportsDir, fname)
+		if err := os.WriteFile(outPath, []byte(sb.String()), 0644); err != nil {
+			ns.addChat("[EXPORT ERR]: " + err.Error())
+			return
+		}
+		if len(list) > 0 {
+			if setClipboardSafe(sb.String()) {
+				ns.addChat(fmt.Sprintf("[EXPORT]: Saved %d props to exports/%s & copied TOML to clipboard!", len(list), fname))
+			} else {
+				ns.addChat(fmt.Sprintf("[EXPORT]: Saved %d props to exports/%s", len(list), fname))
+			}
+		} else {
+			ns.addChat(fmt.Sprintf("[EXPORT]: Saved empty snapshot to exports/%s (0 props in world).", fname))
+		}
+		return
+	}
 	if input == "/chatlog" {
 		ns.mu.RLock()
 		var sb strings.Builder
@@ -3402,7 +4037,8 @@ func handleChatCommand(
 		ns.mu.RLock()
 		var targetPub, targetNick string
 		for pub, p := range ns.peers {
-			if strings.HasPrefix(strings.ToLower(pub), query) || strings.EqualFold(p.Nick, query) {
+			fullTag := strings.ToLower(formatPeerTag(p.Nick, pub))
+			if strings.HasPrefix(strings.ToLower(pub), query) || strings.EqualFold(p.Nick, query) || fullTag == query {
 				targetPub = pub
 				targetNick = p.Nick
 				break
@@ -3474,8 +4110,109 @@ func handleChatCommand(
 	if strings.HasPrefix(input, "/portal ") {
 		u := strings.TrimSpace(strings.TrimPrefix(input, "/portal "))
 		if u != "" {
-			hopFn(u)
+			hopFn(u, true)
 		}
+		return
+	}
+	if strings.HasPrefix(input, "/me ") {
+		act := sanitizeDisplayText(strings.TrimSpace(strings.TrimPrefix(input, "/me ")), 160)
+		if act != "" {
+			ns.mu.RLock()
+			n := ns.nick
+			ns.mu.RUnlock()
+			formatted := fmt.Sprintf("* %s %s", formatPeerTag(n, kp.PubHex()), act)
+			_ = ns.sendJSON(WireMsg{Type: "CHAT", Channel: "global", Text: "* " + act})
+			ns.addChatColor(formatted, rl.NewColor(235, 195, 120, 255))
+		}
+		return
+	}
+	if input == "/outfit" || strings.HasPrefix(input, "/outfit ") {
+		if cfg == nil {
+			return
+		}
+		if cfg.Outfits == nil {
+			cfg.Outfits = make(map[string]OutfitPreset)
+		}
+		fields := strings.Fields(strings.TrimPrefix(input, "/outfit"))
+		if len(fields) == 0 || fields[0] == "list" {
+			if len(cfg.Outfits) == 0 {
+				ns.addChat("[OUTFIT]: No saved outfits yet. Use /outfit save <slot> and /outfit <slot>.")
+				return
+			}
+			var slots []string
+			for k := range cfg.Outfits {
+				slots = append(slots, k)
+			}
+			sort.Strings(slots)
+			for _, sl := range slots {
+				op := cfg.Outfits[sl]
+				avLabel := op.AvatarName
+				if avLabel == "" && len(op.AvatarHash) >= 8 {
+					avLabel = op.AvatarHash[:8]
+				}
+				ns.addChat(fmt.Sprintf("[OUTFIT %s]: nick=%q avatar=%s", sl, op.Nick, avLabel))
+			}
+			return
+		}
+		if fields[0] == "save" {
+			if len(fields) < 2 {
+				ns.addChat("[USAGE]: /outfit save <slot-name-or-number>")
+				return
+			}
+			slot := sanitizeFileName(fields[1])
+			ns.mu.RLock()
+			curN := ns.nick
+			curH := ns.localAvHash
+			ns.mu.RUnlock()
+			avName := ""
+			for _, it := range *avatarInv {
+				if it.Hash == curH {
+					avName = it.Name
+					break
+				}
+			}
+			cfg.Outfits[slot] = OutfitPreset{
+				Nick:       curN,
+				AvatarHash: curH,
+				AvatarName: avName,
+			}
+			saveClientSettings(settingsPath, *cfg)
+			ns.addChat(fmt.Sprintf("[OUTFIT]: Saved slot %q (nick=%s, avatar=%s)", slot, curN, avName))
+			return
+		}
+		slot := sanitizeFileName(fields[0])
+		if fields[0] == "load" && len(fields) >= 2 {
+			slot = sanitizeFileName(fields[1])
+		}
+		op, ok := cfg.Outfits[slot]
+		if !ok {
+			ns.addChat(fmt.Sprintf("[OUTFIT]: Slot %q not found. Use /outfit list or /outfit save %s", slot, slot))
+			return
+		}
+		ns.mu.Lock()
+		if op.Nick != "" {
+			ns.nick = sanitizeDisplayText(op.Nick, 24)
+			cfg.Nick = ns.nick
+		}
+		if isValidHex64(op.AvatarHash) {
+			if _, exists := ns.localAssets[op.AvatarHash]; exists {
+				ns.localAvHash = op.AvatarHash
+				ns.localAvBytes = ns.localAssets[op.AvatarHash]
+				*localAvHash = op.AvatarHash
+			}
+		}
+		curN := ns.nick
+		curH := ns.localAvHash
+		pos := ns.localPos
+		ns.mu.Unlock()
+		saveClientSettings(settingsPath, *cfg)
+		_ = ns.sendJSON(WireMsg{
+			Type:       "STATE",
+			Nick:       curN,
+			Pos:        []float32{pos.X, pos.Y, pos.Z},
+			AvatarHash: curH,
+		})
+		ns.addChat(fmt.Sprintf("[OUTFIT]: Loaded slot %q -> %s", slot, formatPeerTag(curN, kp.PubHex())))
 		return
 	}
 	if strings.HasPrefix(input, "/say ") {
@@ -3765,6 +4502,14 @@ func runRelaySession(ctx context.Context, conn *websocket.Conn, relayHost string
 			handleIncomingChunk(ns, msg)
 
 		case "CHAT":
+			if msg.PubKey == "" {
+				tag := sanitizeDisplayText(msg.Nick, 16)
+				if tag == "" {
+					tag = "RELAY"
+				}
+				ns.addChat(fmt.Sprintf("[%s]: %s", tag, msg.Text))
+				continue
+			}
 			ns.mu.RLock()
 			isBlocked := ns.blockedPeers[msg.PubKey]
 			ns.mu.RUnlock()
@@ -3784,7 +4529,11 @@ func runRelaySession(ctx context.Context, conn *websocket.Conn, relayHost string
 			} else if msg.Channel == "whisper" {
 				prefix = "WHISPER "
 			}
-			ns.addChat(fmt.Sprintf("[%s%s]: %s", prefix, label, msg.Text))
+			if msg.Channel == "global" && strings.HasPrefix(msg.Text, "* ") {
+				ns.addChatColor(fmt.Sprintf("* %s %s", label, strings.TrimPrefix(msg.Text, "* ")), rl.NewColor(235, 195, 120, 255))
+			} else {
+				ns.addChat(fmt.Sprintf("[%s%s]: %s", prefix, label, msg.Text))
+			}
 
 		case "LEAVE":
 			ns.mu.Lock()

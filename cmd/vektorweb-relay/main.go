@@ -67,14 +67,25 @@ type WireMsg struct {
 	Message      string    `json:"message,omitempty"`
 }
 
+type WorldBakedProp struct {
+	ID    string    `toml:"id"`
+	Hash  string    `toml:"hash"`
+	Owner string    `toml:"owner"`
+	Pos   []float32 `toml:"pos"`
+	Yaw   float32   `toml:"yaw"`
+	Scale float32   `toml:"scale"`
+}
+
 type WorldConfigTOML struct {
 	World struct {
 		Title string    `toml:"title"`
+		MOTD  string    `toml:"motd"`
 		Spawn []float32 `toml:"spawn"`
 	} `toml:"world"`
 	Rules struct {
 		Admins []string `toml:"admins"`
 	} `toml:"rules"`
+	Props []WorldBakedProp `toml:"props"`
 }
 
 type StatusResponse struct {
@@ -193,6 +204,7 @@ type RelayServer struct {
 
 	mu              sync.RWMutex
 	worldTitle      string
+	worldMOTD       string
 	worldSpawn      []float32
 	adminKeys       map[string]bool
 	cliAdmins       map[string]bool
@@ -278,6 +290,7 @@ func main() {
 		worldURL:      joinURL,
 		startedAt:     time.Now(),
 		worldTitle:    "VektorWeb World",
+		worldMOTD:     "",
 		worldSpawn:    []float32{0.0, 2.0, 10.0},
 		adminKeys:     make(map[string]bool),
 		cliAdmins:     cliAdmins,
@@ -408,6 +421,7 @@ func (s *RelayServer) reloadConfigFiles(force bool) {
 				if strings.TrimSpace(wc.World.Title) != "" {
 					s.worldTitle = strings.TrimSpace(wc.World.Title)
 				}
+				s.worldMOTD = sanitizeControlChars(wc.World.MOTD, 240)
 				if finiteVec3(wc.World.Spawn) {
 					s.worldSpawn = append([]float32(nil), wc.World.Spawn...)
 				}
@@ -422,6 +436,53 @@ func (s *RelayServer) reloadConfigFiles(force bool) {
 					}
 				}
 				s.adminKeys = admins
+
+				// Sync baked [[props]] defined in world.toml (prefixed "baked_")
+				activeBaked := make(map[string]bool)
+				for idx, bp := range wc.Props {
+					hLower := strings.ToLower(strings.TrimSpace(bp.Hash))
+					if !isValidHex64(hLower) || !finiteVec3(bp.Pos) {
+						continue
+					}
+					if s.blockedItems[hLower] || s.blockedItems[bp.Hash] {
+						continue
+					}
+					propID := sanitizeControlChars(bp.ID, 48)
+					if propID == "" {
+						propID = fmt.Sprintf("baked_%d_%s", idx, hLower[:8])
+					} else if !strings.HasPrefix(propID, "baked_") {
+						propID = "baked_" + propID
+					}
+					yaw := bp.Yaw
+					if math.IsNaN(float64(yaw)) || math.IsInf(float64(yaw), 0) {
+						yaw = 0
+					}
+					scale := bp.Scale
+					if math.IsNaN(float64(scale)) || math.IsInf(float64(scale), 0) || scale <= 0 {
+						scale = 1.0
+					} else if scale > 25.0 {
+						scale = 25.0
+					}
+					owner := strings.ToLower(strings.TrimSpace(bp.Owner))
+					if !isValidHex64(owner) {
+						owner = "0000000000000000000000000000000000000000000000000000000000000000"
+					}
+					activeBaked[propID] = true
+					s.props[propID] = WireMsg{
+						Type:   "PROP_SPAWN",
+						PropID: propID,
+						PubKey: owner,
+						Hash:   hLower,
+						Pos:    []float32{bp.Pos[0], bp.Pos[1], bp.Pos[2]},
+						Yaw:    yaw,
+						Scale:  scale,
+					}
+				}
+				for id := range s.props {
+					if strings.HasPrefix(id, "baked_") && !activeBaked[id] {
+						delete(s.props, id)
+					}
+				}
 			}
 		}
 	}
@@ -496,6 +557,7 @@ end
 	if _, err := os.Stat(tomlPath); os.IsNotExist(err) {
 		starterToml := fmt.Sprintf(`[world]
 title = "Starter VektorWeb Plaza"
+motd = "Welcome to VektorWeb! Press [F1] for controls or type /help."
 author_pubkey = ""
 relay_url = "ws://%s:%s/"
 spawn = [0.0, 2.0, 10.0]
@@ -537,39 +599,129 @@ admins = []
 }
 
 func buildPlazaGLB(w, h, d float32) []byte {
-	hw, hh, hd := w/2, h, d/2
-	verts := []float32{
-		-hw, -hh, -hd, hw, -hh, -hd, hw, -hh, hd, -hw, -hh, hd,
-		-hw, 0, -hd, hw, 0, -hd, hw, 0, hd, -hw, 0, hd,
+	var pos []float32
+	var norm []float32
+	var col []float32
+	var idx []uint16
+
+	minV := [3]float32{1e9, 1e9, 1e9}
+	maxV := [3]float32{-1e9, -1e9, -1e9}
+
+	addQuad := func(p0, p1, p2, p3, n [3]float32, c [4]float32) {
+		base := uint16(len(pos) / 3)
+		pts := [4][3]float32{p0, p1, p2, p3}
+		for _, p := range pts {
+			pos = append(pos, p[0], p[1], p[2])
+			norm = append(norm, n[0], n[1], n[2])
+			col = append(col, c[0], c[1], c[2], c[3])
+			for k := 0; k < 3; k++ {
+				if p[k] < minV[k] {
+					minV[k] = p[k]
+				}
+				if p[k] > maxV[k] {
+					maxV[k] = p[k]
+				}
+			}
+		}
+		idx = append(idx, base, base+1, base+2, base, base+2, base+3)
 	}
-	indices := []uint16{
-		0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6, 0, 4, 5, 0, 5, 1,
-		1, 5, 6, 1, 6, 2, 2, 6, 7, 2, 7, 3, 3, 7, 4, 3, 4, 0,
+
+	addBox := func(cx, cy, cz, sx, sy, sz float32, cTop, cSide [4]float32) {
+		hx, hy, hz := sx/2, sy/2, sz/2
+		x0, x1 := cx-hx, cx+hx
+		y0, y1 := cy-hy, cy+hy
+		z0, z1 := cz-hz, cz+hz
+		// Top (+Y) & Bottom (-Y)
+		addQuad([3]float32{x0, y1, z1}, [3]float32{x1, y1, z1}, [3]float32{x1, y1, z0}, [3]float32{x0, y1, z0}, [3]float32{0, 1, 0}, cTop)
+		addQuad([3]float32{x0, y0, z0}, [3]float32{x1, y0, z0}, [3]float32{x1, y0, z1}, [3]float32{x0, y0, z1}, [3]float32{0, -1, 0}, cSide)
+		// +Z & -Z
+		addQuad([3]float32{x0, y0, z1}, [3]float32{x1, y0, z1}, [3]float32{x1, y1, z1}, [3]float32{x0, y1, z1}, [3]float32{0, 0, 1}, cSide)
+		addQuad([3]float32{x1, y0, z0}, [3]float32{x0, y0, z0}, [3]float32{x0, y1, z0}, [3]float32{x1, y1, z0}, [3]float32{0, 0, -1}, cSide)
+		// +X & -X
+		addQuad([3]float32{x1, y0, z1}, [3]float32{x1, y0, z0}, [3]float32{x1, y1, z0}, [3]float32{x1, y1, z1}, [3]float32{1, 0, 0}, cSide)
+		addQuad([3]float32{x0, y0, z0}, [3]float32{x0, y0, z1}, [3]float32{x0, y1, z1}, [3]float32{x0, y1, z0}, [3]float32{-1, 0, 0}, cSide)
 	}
-	vBytes := make([]byte, len(verts)*4)
-	for i, v := range verts {
-		binary.LittleEndian.PutUint32(vBytes[i*4:], math.Float32bits(v))
+
+	// Dark slate plaza deck + cyan perimeter trim
+	deckTop := [4]float32{0.10, 0.13, 0.19, 1.0}
+	deckSide := [4]float32{0.06, 0.08, 0.12, 1.0}
+	cyanGlow := [4]float32{0.15, 0.85, 0.95, 1.0}
+	goldTrim := [4]float32{0.95, 0.72, 0.20, 1.0}
+	pillarBody := [4]float32{0.16, 0.20, 0.28, 1.0}
+
+	addBox(0, -h/2, 0, w, h, d, deckTop, deckSide)
+
+	// Glowing perimeter trim strips
+	hw, hd := w/2, d/2
+	addBox(0, 0.03, -hd+0.2, w, 0.06, 0.35, cyanGlow, cyanGlow)
+	addBox(0, 0.03, hd-0.2, w, 0.06, 0.35, cyanGlow, cyanGlow)
+	addBox(-hw+0.2, 0.03, 0, 0.35, 0.06, d, cyanGlow, cyanGlow)
+	addBox(hw-0.2, 0.03, 0, 0.35, 0.06, d, cyanGlow, cyanGlow)
+
+	// Walkable stepped central dais (step height 0.22m <= 0.55m max climb)
+	addBox(0, 0.11, 0, 7.5, 0.22, 7.5, [4]float32{0.14, 0.18, 0.26, 1.0}, cyanGlow)
+	addBox(0, 0.33, 0, 4.2, 0.22, 4.2, [4]float32{0.18, 0.23, 0.33, 1.0}, goldTrim)
+
+	// Four corner obelisk pillars with cyan beacon caps
+	offX, offZ := hw-2.2, hd-2.2
+	corners := [4][2]float32{{-offX, -offZ}, {offX, -offZ}, {-offX, offZ}, {offX, offZ}}
+	for _, c := range corners {
+		addBox(c[0], 2.4, c[1], 1.1, 4.8, 1.1, pillarBody, pillarBody)
+		addBox(c[0], 5.05, c[1], 1.25, 0.45, 1.25, cyanGlow, cyanGlow)
 	}
-	iBytes := make([]byte, len(indices)*2)
-	for i, idx := range indices {
-		binary.LittleEndian.PutUint16(iBytes[i*2:], idx)
+
+	vCount := len(pos) / 3
+	pBytes := make([]byte, len(pos)*4)
+	for i, v := range pos {
+		binary.LittleEndian.PutUint32(pBytes[i*4:], math.Float32bits(v))
 	}
-	binBuf := append(vBytes, iBytes...)
+	nBytes := make([]byte, len(norm)*4)
+	for i, v := range norm {
+		binary.LittleEndian.PutUint32(nBytes[i*4:], math.Float32bits(v))
+	}
+	cBytes := make([]byte, len(col)*4)
+	for i, v := range col {
+		binary.LittleEndian.PutUint32(cBytes[i*4:], math.Float32bits(v))
+	}
+	iBytes := make([]byte, len(idx)*2)
+	for i, id := range idx {
+		binary.LittleEndian.PutUint16(iBytes[i*2:], id)
+	}
+	for len(iBytes)%4 != 0 {
+		iBytes = append(iBytes, 0, 0)
+	}
+
+	var binBuf []byte
+	pOff := 0
+	binBuf = append(binBuf, pBytes...)
+	nOff := len(binBuf)
+	binBuf = append(binBuf, nBytes...)
+	cOff := len(binBuf)
+	binBuf = append(binBuf, cBytes...)
+	iOff := len(binBuf)
+	binBuf = append(binBuf, iBytes...)
 
 	gltf := map[string]any{
-		"asset":   map[string]string{"version": "2.0"},
-		"scene":   0,
-		"scenes":  []any{map[string]any{"nodes": []int{0}}},
-		"nodes":   []any{map[string]int{"mesh": 0}},
-		"meshes":  []any{map[string]any{"primitives": []any{map[string]any{"attributes": map[string]int{"POSITION": 0}, "indices": 1}}}},
+		"asset":  map[string]string{"version": "2.0"},
+		"scene":  0,
+		"scenes": []any{map[string]any{"nodes": []int{0}}},
+		"nodes":  []any{map[string]int{"mesh": 0}},
+		"meshes": []any{map[string]any{"primitives": []any{map[string]any{
+			"attributes": map[string]int{"POSITION": 0, "NORMAL": 1, "COLOR_0": 2},
+			"indices":    3,
+		}}}},
 		"buffers": []any{map[string]int{"byteLength": len(binBuf)}},
 		"bufferViews": []any{
-			map[string]int{"buffer": 0, "byteOffset": 0, "byteLength": len(vBytes)},
-			map[string]int{"buffer": 0, "byteOffset": len(vBytes), "byteLength": len(iBytes)},
+			map[string]int{"buffer": 0, "byteOffset": pOff, "byteLength": len(pBytes), "target": 34962},
+			map[string]int{"buffer": 0, "byteOffset": nOff, "byteLength": len(nBytes), "target": 34962},
+			map[string]int{"buffer": 0, "byteOffset": cOff, "byteLength": len(cBytes), "target": 34962},
+			map[string]int{"buffer": 0, "byteOffset": iOff, "byteLength": len(idx) * 2, "target": 34963},
 		},
 		"accessors": []any{
-			map[string]any{"bufferView": 0, "componentType": 5126, "count": 8, "type": "VEC3", "min": []float32{-hw, -hh, -hd}, "max": []float32{hw, 0, hd}},
-			map[string]any{"bufferView": 1, "componentType": 5123, "count": 36, "type": "SCALAR"},
+			map[string]any{"bufferView": 0, "componentType": 5126, "count": vCount, "type": "VEC3", "min": []float32{minV[0], minV[1], minV[2]}, "max": []float32{maxV[0], maxV[1], maxV[2]}},
+			map[string]any{"bufferView": 1, "componentType": 5126, "count": vCount, "type": "VEC3"},
+			map[string]any{"bufferView": 2, "componentType": 5126, "count": vCount, "type": "VEC4"},
+			map[string]any{"bufferView": 3, "componentType": 5123, "count": len(idx), "type": "SCALAR"},
 		},
 	}
 	jBytes, _ := json.Marshal(gltf)
@@ -961,6 +1113,9 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if auth.AvatarHash != "" && auth.AvatarHash != "none" && !isValidHex64(auth.AvatarHash) {
+		auth.AvatarHash = "none"
+	}
 	cc.pubKey = auth.PubKey
 	cc.avatarHash = auth.AvatarHash
 	cc.nick = sanitizeNick(auth.Nick, auth.PubKey)
@@ -1010,6 +1165,7 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.RLock()
 	curSpawn := append([]float32(nil), s.worldSpawn...)
+	curMOTD := s.worldMOTD
 	s.mu.RUnlock()
 	if finiteVec3(curSpawn) {
 		cc.enqueueJSON(WireMsg{
@@ -1017,11 +1173,19 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 			Pos:  curSpawn,
 		}, false)
 	}
+	if curMOTD != "" {
+		cc.enqueueJSON(WireMsg{
+			Type:      "CHAT",
+			Nick:      "MOTD",
+			Channel:   "whisper",
+			Text:      curMOTD,
+			Timestamp: time.Now().Unix(),
+		}, false)
+	}
 
 	if isAdmin {
 		cc.enqueueJSON(WireMsg{
 			Type:      "CHAT",
-			PubKey:    auth.PubKey,
 			Nick:      "RELAY",
 			Channel:   "whisper",
 			Text:      "Admin authenticated (/setspawn [x y z], /kick, /ban, /clearprops)",
@@ -1162,6 +1326,9 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 				s.sendError(cc, "ERR_INVALID_PROP", "prop requires valid prop_id, 64-char sha256 hash, and 3D pos")
 				continue
 			}
+			if math.IsNaN(float64(msg.Yaw)) || math.IsInf(float64(msg.Yaw), 0) {
+				msg.Yaw = 0
+			}
 			if math.IsNaN(float64(msg.Scale)) || math.IsInf(float64(msg.Scale), 0) || msg.Scale <= 0 {
 				msg.Scale = 1.0
 			}
@@ -1227,6 +1394,12 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
+			// Any authenticated user can clear their own placed props via /clearmyprops
+			if txt == "/clearmyprops" {
+				s.handleClearMyProps(cc)
+				continue
+			}
+
 			// Handle admin slash commands (/setspawn, /kick, /ban, /clearprops) if sender is in admins list
 			if txt == "/setspawn" || strings.HasPrefix(txt, "/setspawn ") ||
 				strings.HasPrefix(txt, "/kick ") || strings.HasPrefix(txt, "/ban ") || txt == "/clearprops" {
@@ -1251,6 +1424,32 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 			s.sendError(cc, "ERR_UNKNOWN_TYPE", fmt.Sprintf("unknown message type %q", msg.Type))
 		}
 	}
+}
+
+func (s *RelayServer) handleClearMyProps(cc *ClientConn) {
+	s.mu.Lock()
+	var ids []string
+	for id, pr := range s.props {
+		if strings.EqualFold(pr.PubKey, cc.pubKey) {
+			ids = append(ids, id)
+			delete(s.props, id)
+		}
+	}
+	if len(ids) > 0 {
+		s.savePersistentPropsLocked()
+	}
+	s.mu.Unlock()
+
+	for _, id := range ids {
+		s.broadcast("", WireMsg{Type: "PROP_REMOVE", PropID: id}, false)
+	}
+	cc.enqueueJSON(WireMsg{
+		Type:      "CHAT",
+		Nick:      "RELAY",
+		Channel:   "whisper",
+		Text:      fmt.Sprintf("Cleared %d of your props from the world.", len(ids)),
+		Timestamp: time.Now().Unix(),
+	}, false)
 }
 
 func (s *RelayServer) handleAdminCommand(cc *ClientConn, cmd string) {
@@ -1345,7 +1544,12 @@ func (s *RelayServer) handleAdminCommand(cc *ClientConn, cmd string) {
 		if pub == cc.pubKey {
 			continue
 		}
-		if strings.HasPrefix(strings.ToLower(pub), qLower) || strings.EqualFold(peer.nick, query) {
+		shortPub := strings.ToLower(pub)
+		if len(shortPub) > 6 {
+			shortPub = shortPub[:6]
+		}
+		peerTag := strings.ToLower(peer.nick) + "#" + shortPub
+		if strings.HasPrefix(strings.ToLower(pub), qLower) || strings.EqualFold(peer.nick, query) || peerTag == qLower {
 			target = peer
 			break
 		}
@@ -1391,16 +1595,41 @@ func (s *RelayServer) handleAdminCommand(cc *ClientConn, cmd string) {
 	}
 }
 
+func sanitizeControlChars(raw string, maxLen int) string {
+	var b strings.Builder
+	count := 0
+	for _, r := range strings.TrimSpace(raw) {
+		if r < 32 || r == 127 {
+			continue
+		}
+		b.WriteRune(r)
+		count++
+		if maxLen > 0 && count >= maxLen {
+			break
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
 func sanitizeNick(raw, pub string) string {
-	n := strings.TrimSpace(raw)
+	var b strings.Builder
+	count := 0
+	for _, r := range strings.TrimSpace(raw) {
+		if r < 32 || r == 127 {
+			continue
+		}
+		b.WriteRune(r)
+		count++
+		if count >= 24 {
+			break
+		}
+	}
+	n := strings.TrimSpace(b.String())
 	if n == "" {
 		if len(pub) >= 8 {
 			return pub[:8]
 		}
 		return "anon"
-	}
-	if len(n) > 24 {
-		n = n[:24]
 	}
 	return n
 }
