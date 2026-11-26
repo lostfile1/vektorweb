@@ -68,19 +68,6 @@ To test multiplayer locally on the same machine, launch a second profile in anot
 
 ---
 
-## Deploying to a Debian VPS (Nginx + Certbot)
-
-Use [`setup_vps.sh`](./setup_vps.sh) to install `vektorweb-relay` as a hardened `systemd` service behind Nginx with automatic Let's Encrypt TLS (`wss://`):
-```bash
-sudo bash setup_vps.sh vektor.whitenode45.ddns.net 7777
-```
-Reload configuration, `world.toml`, `bans.txt`, or `blocked_items.txt` without dropping connected players:
-```bash
-sudo systemctl reload vektorweb-relay
-```
-
----
-
 ## Client Controls & Slash Commands
 
 ### Keybinds
