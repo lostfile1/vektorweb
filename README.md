@@ -89,7 +89,8 @@ sudo systemctl reload vektorweb-relay
 | **`WASD` + Mouse** | Move and look (`[Shift]` Sprint, `[Space]` Jump, `[Esc]` Unlock/Lock cursor) |
 | **`[F]`** | Toggle Walk + Ground Collision / Free-Fly camera |
 | **`[C]`** | Toggle 1st-Person / 3rd-Person camera (Mouse wheel zooms distance) |
-| **`[R]`** | Return to world spawn point (or reset prop transforms while in Build Mode) |
+| **`[R]` / `[H]`** | Return to world spawn point (reset prop in Build Mode) / Toggle Spawn Waypoint HUD |
+| **`[1]`–`[9]`** | Switch embedded glTF animation clip on your equipped avatar |
 | **`[I]`** | Open Local Inventory & Key-Signed Transfers (`[R]` to transfer/sell selected item) |
 | **Drag & Drop `.glb`** | Equip `.glb` as live avatar or import into prop inventory |
 | **`[G]` / `[Esc]`** | Toggle / Exit 3D Build Mode |
@@ -99,21 +100,26 @@ sudo systemctl reload vektorweb-relay
 | **`[F4]`** | Set world spawn point to your current position (in Build Mode) |
 | **`[V]` / `[M]`** | Hold Push-to-Talk spatial voice (`35m`) / Mute incoming voice |
 | **`[T]` or `[/]`** | Open chat input (`[Up]`/`[Down]` command history, `Ctrl+V` paste) |
-| **`[Tab]`** | Open World Portal Directory (`~/.vektorweb-client/worlds.toml`) |
+| **`[Tab]`** | Open World Portal Directory with live `/status.json` counts (`[F]` pins favorite to #1) |
 | **`[F1]` / `[F2]` / `[F3]`** | Controls Help / Client Settings (`FOV`, sensitivity, fog) / Online Peers list |
 | **`[F12]`** | Save screenshot to `~/.vektorweb-client/exports/` |
 
 ### Chat & Admin Commands
 * `/help` — Print available commands and hotkeys in chat
+* `/me <action>` — Broadcast an emote action (`* Nick#pubkey6 <action>`)
+* `/outfit [save <slot>|list|<slot>]` — Save or switch local `(nick, avatar)` presets in `settings.toml`
 * `/clear` — Clear the on-screen chat buffer
+* `/clearmyprops` — Remove all props you placed in the current world
 * `/nick <name>` — Set and persist your display nickname in `settings.toml`
 * `/bookmark [name]` — Save the active world URL to your `[Tab]` World Directory (`worlds.toml`)
 * `/say <message>` — Send local proximity chat (`35m` radius)
 * `/w <nick|pubkey> <message>` — Send a private whisper to an online peer
-* `/portal <url>` — Hop directly to another `world.toml` or `vektorweb://` link
+* `/portal <url>` / `/back` / `/history` — Hop to a world URL, return to previous world, or list visited worlds
+* `/range` — Toggle the `35m` spatial voice & `/say` proximity ground ring
 * `/setspawn [x y z]` — Set spawn point (saves locally and updates `world.toml` on the relay if admin)
 * `/pubkey` / `/copykey` — Print your 64-char Ed25519 public key or copy it to the clipboard
 * `/mint <buyer_pubkey> <lock|free>` — Sign a `VEKTORWEB_LICENSE_V1` certificate for your active `.glb`
+* `/exportworld` — Export all active world props as paste-ready `[[props]]` TOML to `exports/` & clipboard
 * `/chatlog` — Export recent chat history to `exports/`
 * **Admin Commands** *(requires pubkey in `rules.admins` or `-admin`)*: `/setspawn [x y z]`, `/kick <nick|pubkey>`, `/ban <nick|pubkey>`, `/clearprops`
 
@@ -124,6 +130,7 @@ sudo systemctl reload vektorweb-relay
 ```toml
 [world]
 title = "VektorWeb Nexus Plaza"
+motd = "Welcome to VektorWeb! Press [F1] for controls or type /help."
 author_pubkey = ""
 relay_url = "wss://vektor.whitenode45.ddns.net/"
 spawn = [0.0, 2.0, 15.0]
