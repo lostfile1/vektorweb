@@ -1463,6 +1463,10 @@ func main() {
 	rl.SetConfigFlags(rl.FlagWindowResizable | rl.FlagMsaa4xHint)
 	rl.InitWindow(1280, 720, "VektorWeb - "+activeWorld.Manifest.World.Title)
 	defer rl.CloseWindow()
+	uiFont, hasUIFont = loadBestUIFont(baseDir)
+	if hasUIFont {
+		defer rl.UnloadFont(uiFont)
+	}
 	rl.SetTargetFPS(60)
 
 	rl.InitAudioDevice()
@@ -1861,6 +1865,7 @@ func main() {
 		}
 
 		if pendingDrop != nil {
+			drawModalBackdrop(sw, sh)
 			if rl.IsKeyPressed(rl.KeyOne) {
 				destP := filepath.Join(avatarsDir, pendingDrop.FileName)
 				_ = os.WriteFile(destP, pendingDrop.Bytes, 0644)
@@ -1999,6 +2004,7 @@ func main() {
 
 		// Handle incoming client-to-client transfer offer prompt ([Y] Accept / [N] Decline)
 		if hasIncomingOffer && pendingDrop == nil {
+			drawModalBackdrop(sw, sh)
 			netState.mu.Lock()
 			offer := netState.incomingXfers[0]
 			netState.mu.Unlock()
@@ -2046,12 +2052,14 @@ func main() {
 			if rl.IsKeyPressed(rl.KeyF1) {
 				helpOpen = !helpOpen
 				if helpOpen {
+			drawModalBackdrop(sw, sh)
 					invOpen, dirOpen, settingsOpen, peersOpen, transferModalOpen = false, false, false, false, false
 				}
 			}
 			if rl.IsKeyPressed(rl.KeyF2) {
 				settingsOpen = !settingsOpen
 				if settingsOpen {
+			drawModalBackdrop(sw, sh)
 					invOpen, dirOpen, helpOpen, peersOpen, transferModalOpen = false, false, false, false, false
 					settingsCursor = 0
 				}
@@ -2059,6 +2067,7 @@ func main() {
 			if rl.IsKeyPressed(rl.KeyF3) {
 				peersOpen = !peersOpen
 				if peersOpen {
+			drawModalBackdrop(sw, sh)
 					invOpen, dirOpen, helpOpen, settingsOpen, transferModalOpen = false, false, false, false, false
 					peerCursor = 0
 				}
@@ -2075,6 +2084,7 @@ func main() {
 				preselectedPeerPub = ""
 				dirOpen, helpOpen, settingsOpen, peersOpen = false, false, false, false
 				if invOpen {
+			drawModalBackdrop(sw, sh)
 					avatarInv = scanInventoryFolder(avatarsDir, "avatar", cacheDir, kp.PubHex(), maxAvMB*1024*1024, localAssets)
 					propInv = scanInventoryFolder(itemsDir, "prop", cacheDir, kp.PubHex(), maxItemMB*1024*1024, localAssets)
 					for _, it := range propInv {
@@ -2104,6 +2114,7 @@ func main() {
 				dirOpen = !dirOpen
 				invOpen, transferModalOpen, helpOpen, settingsOpen, peersOpen = false, false, false, false, false
 				if dirOpen {
+			drawModalBackdrop(sw, sh)
 					dirCursor = 0
 					refreshPortalStatuses(directory)
 				}
@@ -2774,7 +2785,7 @@ func main() {
 
 			// Ctrl+V clipboard paste into chat input
 			if (rl.IsKeyDown(rl.KeyLeftControl) || rl.IsKeyDown(rl.KeyRightControl)) && rl.IsKeyPressed(rl.KeyV) {
-				clip := sanitizeDisplayText(rl.GetClipboardText(), 240)
+				clip := sanitizeDisplayText(getClipboardSafe(), 240)
 				if clip != "" {
 					rem := 240 - len([]rune(chatInput))
 					if rem > 0 {
@@ -3047,12 +3058,13 @@ func main() {
 				borderCol = rl.Lime
 				txtCol = rl.Lime
 			}
-			tw := rl.MeasureText(txt, 15)
-			bx := int32(sl.screenPos.X) - tw/2 - 6
-			by := int32(sl.screenPos.Y) - 11
-			rl.DrawRectangle(bx, by, tw+12, 22, rl.NewColor(10, 14, 22, 190))
-			rl.DrawRectangleLines(bx, by, tw+12, 22, borderCol)
-			rl.DrawText(txt, bx+6, by+3, 15, txtCol)
+			tw := uiTextWidth(txt, 16)
+			bx := int32(sl.screenPos.X) - tw/2 - 8
+			by := int32(sl.screenPos.Y) - 12
+			pill := rl.NewRectangle(float32(bx), float32(by), float32(tw+16), 24)
+			rl.DrawRectangleRounded(pill, 0.35, 6, rl.NewColor(10, 14, 24, 215))
+			rl.DrawRectangleRoundedLinesEx(pill, 0.35, 6, 1.1, borderCol)
+			drawUITextShadow(txt, bx+8, by+4, 16, txtCol)
 		}
 
 		// Center crosshair + look-at target tooltip
@@ -3066,8 +3078,8 @@ func main() {
 			rl.DrawLine(cx, cy-6, cx, cy+6, crossCol)
 
 			if lookedAt != nil {
-				w1 := rl.MeasureText(lookedAt.Label, 16)
-				w2 := rl.MeasureText(lookedAt.SubLabel, 14)
+				w1 := uiTextWidth(lookedAt.Label, 16)
+				w2 := uiTextWidth(lookedAt.SubLabel, 14)
 				boxW := w1
 				if w2 > boxW {
 					boxW = w2
@@ -3075,10 +3087,9 @@ func main() {
 				boxW += 20
 				bx := cx - boxW/2
 				by := cy + 16
-				rl.DrawRectangle(bx, by, boxW, 44, rl.NewColor(12, 16, 26, 215))
-				rl.DrawRectangleLines(bx, by, boxW, 44, rl.Gold)
-				rl.DrawText(lookedAt.Label, bx+10, by+5, 16, rl.Gold)
-				rl.DrawText(lookedAt.SubLabel, bx+10, by+24, 14, rl.RayWhite)
+				drawGlassPanel(bx, by, boxW, 46, rl.NewColor(56, 189, 248, 255), 225)
+				drawUITextShadow(lookedAt.Label, bx+10, by+6, 16, rl.NewColor(125, 211, 252, 255))
+				drawUIText(lookedAt.SubLabel, bx+10, by+25, 14, rl.NewColor(215, 224, 238, 255))
 			}
 		}
 
@@ -3126,17 +3137,17 @@ func main() {
 		}
 
 		// Auto-size HUD width to fit content cleanly while reserving space for top-right status/radar
-		desiredW := rl.MeasureText(headerLine, 17) + 42
-		if w2 := rl.MeasureText(statsLine, 16) + 24; w2 > desiredW {
+		desiredW := uiTextWidth(headerLine, 17) + 42
+		if w2 := uiTextWidth(statsLine, 16) + 24; w2 > desiredW {
 			desiredW = w2
 		}
 		if luaHUD != "" {
-			if w3 := rl.MeasureText(luaHUD, 16) + 24; w3 > desiredW {
+			if w3 := uiTextWidth(luaHUD, 16) + 24; w3 > desiredW {
 				desiredW = w3
 			}
 		}
 		if buildLine != "" {
-			if w4 := rl.MeasureText(buildLine, 15) + 24; w4 > desiredW {
+			if w4 := uiTextWidth(buildLine, 15) + 24; w4 > desiredW {
 				desiredW = w4
 			}
 		}
@@ -3159,36 +3170,35 @@ func main() {
 		if buildLine != "" {
 			hudH += 24
 		}
-		rl.DrawRectangle(12, 12, hudW, hudH, rl.NewColor(14, 18, 28, 195))
-		rl.DrawRectangleLines(12, 12, hudW, hudH, rl.NewColor(55, 75, 105, 200))
+		drawGlassPanel(12, 12, hudW, hudH, rl.NewColor(56, 189, 248, 255), 222)
 
 		rl.BeginScissorMode(14, 14, hudW-4, hudH-4)
-		rl.DrawCircle(26, 26, 5, connDot)
-		rl.DrawText(truncateToWidth(headerLine, 17, hudW-38), 38, 18, 17, rl.RayWhite)
-		rl.DrawText(truncateToWidth(statsLine, 16, hudW-22), 22, 44, 16, rl.LightGray)
+		rl.DrawCircle(26, 27, 5, connDot)
+		drawUITextShadow(truncateToWidth(headerLine, 17, hudW-38), 38, 18, 17, rl.RayWhite)
+		drawUIText(truncateToWidth(statsLine, 16, hudW-22), 22, 44, 16, rl.LightGray)
 
 		nextHudY := int32(68)
 		if luaHUD != "" {
-			rl.DrawText(truncateToWidth(luaHUD, 16, hudW-22), 22, nextHudY, 16, rl.Gold)
+			drawUIText(truncateToWidth(luaHUD, 16, hudW-22), 22, nextHudY, 16, rl.Gold)
 			nextHudY += 24
 		}
 		if buildLine != "" {
-			rl.DrawText(truncateToWidth(buildLine, 15, hudW-22), 22, nextHudY, 15, rl.Lime)
+			drawUIText(truncateToWidth(buildLine, 15, hudW-22), 22, nextHudY, 15, rl.Lime)
 		}
 		rl.EndScissorMode()
 
 		if rl.IsKeyDown(rl.KeyV) && !chatActive {
-			rl.DrawRectangle(sw-260, 12, 246, 28, rl.NewColor(20, 45, 25, 215))
-			rl.DrawRectangleLines(sw-260, 12, 246, 28, rl.Lime)
-			rl.DrawText("[MIC LIVE - SPATIAL TX]", sw-248, 18, 16, rl.Lime)
+			lbl := "MIC LIVE  •  35m SPATIAL TX"
+			bw := uiTextWidth(lbl, 15) + 22
+			drawKeyBadge(lbl, sw-bw-14, 12, 15, rl.Lime, rl.NewColor(18, 44, 26, 225), rl.Lime)
 		} else if isMuted {
-			rl.DrawRectangle(sw-220, 12, 206, 28, rl.NewColor(50, 18, 22, 215))
-			rl.DrawRectangleLines(sw-220, 12, 206, 28, rl.Red)
-			rl.DrawText("[AUDIO MUTED - M]", sw-206, 18, 16, rl.Red)
+			lbl := "VOICE MUTED  [M]"
+			bw := uiTextWidth(lbl, 15) + 22
+			drawKeyBadge(lbl, sw-bw-14, 12, 15, rl.NewColor(255, 115, 115, 255), rl.NewColor(52, 18, 22, 225), rl.Red)
 		} else if !cursorLocked && !anyOverlay {
-			rl.DrawRectangle(sw-275, 12, 261, 28, rl.NewColor(35, 30, 16, 215))
-			rl.DrawRectangleLines(sw-275, 12, 261, 28, rl.Gold)
-			rl.DrawText("[CLICK WINDOW TO LOOK]", sw-262, 18, 16, rl.Gold)
+			lbl := "CLICK WINDOW TO LOOK"
+			bw := uiTextWidth(lbl, 15) + 22
+			drawKeyBadge(lbl, sw-bw-14, 12, 15, rl.Gold, rl.NewColor(36, 30, 16, 225), rl.Gold)
 		}
 
 		if cfg.ShowRadar {
@@ -3214,10 +3224,14 @@ func main() {
 				}
 				bw := int32(190)
 				bx := sw - bw - 14
-				rl.DrawRectangle(bx, dlY, bw, 32, rl.NewColor(14, 18, 28, 215))
-				rl.DrawRectangleLines(bx, dlY, bw, 32, rl.SkyBlue)
-				rl.DrawRectangle(bx+4, dlY+20, int32(float32(bw-8)*pct), 7, rl.SkyBlue)
-				rl.DrawText(fmt.Sprintf("DL %s.. %d/%d", dl.Hash[:6], dl.Received, dl.Total), bx+6, dlY+4, 13, rl.RayWhite)
+				dlRec := rl.NewRectangle(float32(bx), float32(dlY), float32(bw), 34)
+				rl.DrawRectangleRounded(dlRec, 0.22, 6, rl.NewColor(13, 17, 27, 225))
+				rl.DrawRectangleRoundedLinesEx(dlRec, 0.22, 6, 1.1, rl.NewColor(56, 189, 248, 220))
+				trackRec := rl.NewRectangle(float32(bx+6), float32(dlY+22), float32(bw-12), 6)
+				rl.DrawRectangleRounded(trackRec, 0.5, 4, rl.NewColor(28, 38, 56, 255))
+				fillRec := rl.NewRectangle(float32(bx+6), float32(dlY+22), float32(bw-12)*pct, 6)
+				rl.DrawRectangleRounded(fillRec, 0.5, 4, rl.NewColor(56, 189, 248, 255))
+				drawUIText(fmt.Sprintf("DL %s.. %d/%d", dl.Hash[:6], dl.Received, dl.Total), bx+8, dlY+4, 13, rl.RayWhite)
 				dlY += 38
 			}
 		}
@@ -3264,29 +3278,29 @@ func main() {
 			panelH := headerH + bodyH
 			panelY := sh - 46 - panelH
 
-			bgAlpha := uint8(190)
-			borderCol := rl.NewColor(55, 75, 105, 190)
+			bgAlpha := uint8(196)
+			borderCol := rl.NewColor(62, 82, 118, 200)
 			if chatActive {
-				bgAlpha = 228
-				borderCol = rl.NewColor(80, 175, 130, 230)
+				bgAlpha = 232
+				borderCol = rl.NewColor(56, 189, 248, 235)
 			}
-			rl.DrawRectangle(chatX, panelY, chatBoxW, panelH, rl.NewColor(11, 15, 23, bgAlpha))
-			rl.DrawRectangleLines(chatX, panelY, chatBoxW, panelH, borderCol)
-			// Subtle left accent bar for a crisp terminal/HUD silhouette
-			rl.DrawRectangle(chatX, panelY, 3, panelH, borderCol)
+			chatRec := rl.NewRectangle(float32(chatX), float32(panelY), float32(chatBoxW), float32(panelH))
+			rl.DrawRectangleRounded(chatRec, 0.04, 8, rl.NewColor(13, 17, 27, bgAlpha))
+			rl.DrawRectangleRoundedLinesEx(chatRec, 0.04, 8, 1.2, borderCol)
 
 			if chatActive {
-				rl.DrawRectangle(chatX+3, panelY+1, chatBoxW-4, headerH-1, rl.NewColor(18, 25, 38, 240))
-				rl.DrawText("COMMS  |  /help /clear /nick /bookmark /copykey  |  [Up/Dn] History", chatX+chatPadX, panelY+4, 13, rl.SkyBlue)
+				hdrRec := rl.NewRectangle(float32(chatX+2), float32(panelY+2), float32(chatBoxW-4), float32(headerH-1))
+				rl.DrawRectangleRounded(hdrRec, 0.18, 6, rl.NewColor(20, 28, 44, 240))
+				drawUIText("COMMS  •  /help /me /outfit /range /back /copykey  •  [Up/Dn] History", chatX+chatPadX, panelY+4, 13, rl.NewColor(125, 211, 252, 255))
 			}
 
 			rl.BeginScissorMode(chatX+4, panelY+headerH+2, chatBoxW-8, bodyH-4)
 			if len(wrappedLines) == 0 {
-				rl.DrawText("No messages yet. Type below and press [Enter] to send...", chatX+chatPadX, panelY+headerH+chatPadY, 15, rl.Gray)
+				drawUIText("No messages yet. Type below and press [Enter] to send...", chatX+chatPadX, panelY+headerH+chatPadY, 15, rl.Gray)
 			} else {
 				cy := panelY + headerH + chatPadY
 				for _, wl := range wrappedLines {
-					rl.DrawText(wl.text, chatX+chatPadX, cy, chatFontSize, wl.color)
+					drawUIText(wl.text, chatX+chatPadX, cy, chatFontSize, wl.color)
 					cy += chatLineH
 				}
 			}
@@ -3294,32 +3308,36 @@ func main() {
 		}
 
 		if chatActive {
-			inputY := sh - 40
-			inputH := int32(28)
-			rl.DrawRectangle(chatX, inputY, chatBoxW, inputH, rl.NewColor(18, 26, 38, 245))
-			rl.DrawRectangleLines(chatX, inputY, chatBoxW, inputH, rl.Lime)
-			cursorBlink := "_"
+			inputY := sh - 41
+			inputH := int32(30)
+			inRec := rl.NewRectangle(float32(chatX), float32(inputY), float32(chatBoxW), float32(inputH))
+			rl.DrawRectangleRounded(inRec, 0.22, 8, rl.NewColor(17, 24, 38, 246))
+			rl.DrawRectangleRoundedLinesEx(inRec, 0.22, 8, 1.3, rl.NewColor(56, 189, 248, 245))
+			cursorBlink := "|"
 			if int(rl.GetTime()*2.2)%2 == 1 {
 				cursorBlink = " "
 			}
-			renderedInput := fitInputTail("> ", chatInput, cursorBlink, 17, chatBoxW-18)
-			rl.BeginScissorMode(chatX+4, inputY+2, chatBoxW-8, inputH-4)
-			rl.DrawText(renderedInput, chatX+9, inputY+6, 17, rl.Lime)
+			renderedInput := fitInputTail("> ", chatInput, cursorBlink, 17, chatBoxW-20)
+			rl.BeginScissorMode(chatX+6, inputY+2, chatBoxW-12, inputH-4)
+			drawUIText(renderedInput, chatX+10, inputY+6, 17, rl.NewColor(165, 243, 252, 255))
 			rl.EndScissorMode()
 		} else {
-			hintTxt := "[I] Inv/Trade | [C] 3rd-Person | [F] Walk/Fly | [R] Spawn | [T] Chat | [V] Voice | [F1] Help | [F2] Settings | [F3] Peers"
-			if rl.MeasureText(hintTxt, 15) > sw-28 {
-				hintTxt = "[I] Inv | [C] 3P | [F] Walk/Fly | [T] Chat | [V] Voice | [F1] Help | [F2] Settings | [F3] Peers"
+			hintTxt := "[I] Inventory  •  [C] 3rd-Person  •  [F] Walk/Fly  •  [R] Spawn  •  [T] Chat  •  [V] Voice  •  [Tab] Worlds  •  [F1] Help  •  [F2] Settings"
+			if uiTextWidth(hintTxt, 14) > sw-36 {
+				hintTxt = "[I] Inv  •  [C] 3P  •  [F] Walk/Fly  •  [T] Chat  •  [V] Voice  •  [Tab] Worlds  •  [F1] Help  •  [F2] Settings"
 			}
-			rl.DrawText(hintTxt, 14, sh-30, 15, rl.Gray)
+			dockW := uiTextWidth(hintTxt, 14) + 22
+			dockRec := rl.NewRectangle(12, float32(sh-34), float32(dockW), 24)
+			rl.DrawRectangleRounded(dockRec, 0.32, 6, rl.NewColor(13, 17, 27, 195))
+			rl.DrawRectangleRoundedLinesEx(dockRec, 0.32, 6, 1.0, rl.NewColor(54, 72, 104, 180))
+			drawUIText(hintTxt, 23, sh-29, 14, rl.NewColor(180, 194, 216, 235))
 		}
 
 		if invOpen {
 			mw, mh := int32(720), int32(450)
 			mx, my := (sw-mw)/2, (sh-mh)/2
-			rl.DrawRectangle(mx, my, mw, mh, rl.NewColor(14, 18, 26, 248))
-			rl.DrawRectangleLines(mx, my, mw, mh, rl.SkyBlue)
-			rl.DrawText("LOCAL INVENTORY & KEY-SIGNED TRANSFERS (~/.vektorweb-client/)", mx+24, my+18, 18, rl.SkyBlue)
+			drawGlassPanel(mx, my, mw, mh, rl.SkyBlue, 246)
+			drawUITextShadow("LOCAL INVENTORY & KEY-SIGNED TRANSFERS (~/.vektorweb-client/)", mx+24, my+18, 18, rl.SkyBlue)
 
 			propCol := rl.Gray
 			avCol := rl.Gray
@@ -3330,19 +3348,19 @@ func main() {
 				avCol = rl.Lime
 				activeList = avatarInv
 			}
-			rl.DrawText(fmt.Sprintf("[1] Props (%d)", len(propInv)), mx+24, my+50, 18, propCol)
-			rl.DrawText(fmt.Sprintf("[2] Avatars (%d)", len(avatarInv)), mx+195, my+50, 18, avCol)
+			drawUIText(fmt.Sprintf("[1] Props (%d)", len(propInv)), mx+24, my+50, 18, propCol)
+			drawUIText(fmt.Sprintf("[2] Avatars (%d)", len(avatarInv)), mx+195, my+50, 18, avCol)
 
 			if transferModalOpen && len(activeList) > 0 {
 				chosen := activeList[invCursor%len(activeList)]
-				rl.DrawText("TRANSFER ITEM: "+chosen.Name, mx+24, my+88, 18, rl.Gold)
+				drawUIText("TRANSFER ITEM: "+chosen.Name, mx+24, my+88, 18, rl.Gold)
 				lockLabel := "VENDOR-LOCKED (Recipient CANNOT resell/redistribute)"
 				lockCol := rl.SkyBlue
 				if transferAllowResale {
 					lockLabel = "TRANSFERABLE (Recipient MAY transfer to others)"
 					lockCol = rl.Lime
 				}
-				rl.DrawText("[L] License Mode: "+lockLabel, mx+24, my+116, 16, lockCol)
+				drawUIText("[L] License Mode: "+lockLabel, mx+24, my+116, 16, lockCol)
 
 				netState.mu.RLock()
 				var onlinePeers []*RemotePeer
@@ -3354,9 +3372,9 @@ func main() {
 				netState.mu.RUnlock()
 
 				if len(onlinePeers) == 0 {
-					rl.DrawText("No online peers in this world to transfer to.", mx+24, my+158, 17, rl.LightGray)
+					drawUIText("No online peers in this world to transfer to.", mx+24, my+158, 17, rl.LightGray)
 				} else {
-					rl.DrawText("Select Recipient Peer:", mx+24, my+150, 17, rl.RayWhite)
+					drawUIText("Select Recipient Peer:", mx+24, my+150, 17, rl.RayWhite)
 					for i, p := range onlinePeers {
 						if i >= 6 {
 							break
@@ -3367,13 +3385,13 @@ func main() {
 							prefix = "-> "
 							col = rl.Gold
 						}
-						rl.DrawText(fmt.Sprintf("%s%s (%s...)", prefix, formatPeerTag(p.Nick, p.PubKey), p.PubKey[:12]), mx+24, my+int32(178+i*28), 17, col)
+						drawUIText(fmt.Sprintf("%s%s (%s...)", prefix, formatPeerTag(p.Nick, p.PubKey), p.PubKey[:12]), mx+24, my+int32(178+i*28), 17, col)
 					}
 				}
-				rl.DrawText("[Up/Down] Recipient | [L] Toggle Vendor-Lock | [Enter] Sign & Send | [Esc] Back", mx+24, my+mh-34, 15, rl.Gray)
+				drawUIText("[Up/Down] Recipient | [L] Toggle Vendor-Lock | [Enter] Sign & Send | [Esc] Back", mx+24, my+mh-34, 15, rl.Gray)
 			} else {
 				if len(activeList) == 0 {
-					rl.DrawText("No .glb files found. Drag & drop a .glb onto the window!", mx+24, my+98, 17, rl.LightGray)
+					drawUIText("No .glb files found. Drag & drop a .glb onto the window!", mx+24, my+98, 17, rl.LightGray)
 				} else {
 					for i, item := range activeList {
 						if i >= 8 {
@@ -3394,19 +3412,18 @@ func main() {
 							meta += fmt.Sprintf(" | %.2fx%.2fx%.2fm", item.Bounds[0], item.Bounds[1], item.Bounds[2])
 						}
 						rowTxt := fmt.Sprintf("%s%s (%s) [%s]%s%s", prefix, item.Name, item.Hash[:6], meta, item.StatusTag, equipped)
-						rl.DrawText(truncateToWidth(rowTxt, 15, mw-48), mx+24, my+int32(88+i*32), 15, col)
+						drawUIText(truncateToWidth(rowTxt, 15, mw-48), mx+24, my+int32(88+i*32), 15, col)
 					}
 				}
-				rl.DrawText("[Up/Dn] Select | [Enter] Equip/Arm | [R] Transfer | [D] Delete | [I/Esc] Close", mx+24, my+mh-34, 15, rl.Gray)
+				drawUIText("[Up/Dn] Select | [Enter] Equip/Arm | [R] Transfer | [D] Delete | [I/Esc] Close", mx+24, my+mh-34, 15, rl.Gray)
 			}
 		}
 
 		if settingsOpen {
 			mw, mh := int32(580), int32(375)
 			mx, my := (sw-mw)/2, (sh-mh)/2
-			rl.DrawRectangle(mx, my, mw, mh, rl.NewColor(14, 18, 26, 248))
-			rl.DrawRectangleLines(mx, my, mw, mh, rl.SkyBlue)
-			rl.DrawText("CLIENT SETTINGS (Saved to settings.toml)", mx+24, my+18, 19, rl.SkyBlue)
+			drawGlassPanel(mx, my, mw, mh, rl.SkyBlue, 246)
+			drawUITextShadow("CLIENT SETTINGS (Saved to settings.toml)", mx+24, my+18, 19, rl.SkyBlue)
 
 			opts := []string{
 				fmt.Sprintf("Field of View (FOV) : %.0f deg", cfg.FOV),
@@ -3424,17 +3441,16 @@ func main() {
 					prefix = "-> "
 					col = rl.Gold
 				}
-				rl.DrawText(prefix+line, mx+24, my+int32(62+i*34), 17, col)
+				drawUIText(prefix+line, mx+24, my+int32(62+i*34), 17, col)
 			}
-			rl.DrawText("[Up/Down] Select  |  [Left/Right] Adjust  |  [F2 / Esc] Close", mx+24, my+mh-34, 15, rl.Gray)
+			drawUIText("[Up/Down] Select  |  [Left/Right] Adjust  |  [F2 / Esc] Close", mx+24, my+mh-34, 15, rl.Gray)
 		}
 
 		if peersOpen {
 			mw, mh := int32(640), int32(380)
 			mx, my := (sw-mw)/2, (sh-mh)/2
-			rl.DrawRectangle(mx, my, mw, mh, rl.NewColor(14, 18, 26, 248))
-			rl.DrawRectangleLines(mx, my, mw, mh, rl.SkyBlue)
-			rl.DrawText("ONLINE PEERS IN WORLD", mx+24, my+18, 19, rl.SkyBlue)
+			drawGlassPanel(mx, my, mw, mh, rl.SkyBlue, 246)
+			drawUITextShadow("ONLINE PEERS IN WORLD", mx+24, my+18, 19, rl.SkyBlue)
 
 			netState.mu.RLock()
 			var onlinePeers []*RemotePeer
@@ -3450,7 +3466,7 @@ func main() {
 			netState.mu.RUnlock()
 
 			if len(onlinePeers) == 0 {
-				rl.DrawText("No other peers currently connected.", mx+24, my+70, 17, rl.LightGray)
+				drawUIText("No other peers currently connected.", mx+24, my+70, 17, rl.LightGray)
 			} else {
 				for i, p := range onlinePeers {
 					if i >= 8 {
@@ -3467,10 +3483,10 @@ func main() {
 						tag = " [BLOCKED]"
 					}
 					dist := rl.Vector3Distance(cam.Position, p.Pos)
-					rl.DrawText(fmt.Sprintf("%s%s (%s...) — %.1fm%s", prefix, formatPeerTag(p.Nick, p.PubKey), p.PubKey[:12], dist, tag), mx+24, my+int32(60+i*30), 17, col)
+					drawUIText(fmt.Sprintf("%s%s (%s...) — %.1fm%s", prefix, formatPeerTag(p.Nick, p.PubKey), p.PubKey[:12], dist, tag), mx+24, my+int32(60+i*30), 17, col)
 				}
 			}
-			rl.DrawText("[Up/Down] Select | [Enter] Teleport To | [B] Block/Mute | [F3 / Esc] Close", mx+24, my+mh-34, 15, rl.Gray)
+			drawUIText("[Up/Down] Select | [Enter] Teleport To | [B] Block/Mute | [F3 / Esc] Close", mx+24, my+mh-34, 15, rl.Gray)
 		}
 
 		if hasIncomingOffer && pendingDrop == nil {
@@ -3480,37 +3496,34 @@ func main() {
 
 			mw, mh := int32(660), int32(220)
 			mx, my := (sw-mw)/2, (sh-mh)/2
-			rl.DrawRectangle(mx, my, mw, mh, rl.NewColor(14, 20, 30, 248))
-			rl.DrawRectangleLines(mx, my, mw, mh, rl.Gold)
-			rl.DrawText("INCOMING KEY-SIGNED ASSET TRANSFER", mx+24, my+20, 19, rl.Gold)
-			rl.DrawText(fmt.Sprintf("From: %s (%s...)", offer.FromNick, offer.FromPub[:12]), mx+24, my+52, 17, rl.RayWhite)
-			rl.DrawText(fmt.Sprintf("Item: %s (%s)", offer.FileName, offer.AssetKind), mx+24, my+78, 17, rl.SkyBlue)
+			drawGlassPanel(mx, my, mw, mh, rl.Gold, 248)
+			drawUITextShadow("INCOMING KEY-SIGNED ASSET TRANSFER", mx+24, my+20, 19, rl.Gold)
+			drawUIText(fmt.Sprintf("From: %s (%s...)", offer.FromNick, offer.FromPub[:12]), mx+24, my+52, 17, rl.RayWhite)
+			drawUIText(fmt.Sprintf("Item: %s (%s)", offer.FileName, offer.AssetKind), mx+24, my+78, 17, rl.SkyBlue)
 			licInfo := "License: VENDOR-LOCKED (Bound to your Ed25519 key; non-transferable)"
 			if offer.License != nil && offer.License.Transferable {
 				licInfo = "License: TRANSFERABLE (Bound to your Ed25519 key; resale allowed)"
 			}
-			rl.DrawText(licInfo, mx+24, my+106, 15, rl.Lime)
-			rl.DrawText("[Y] Accept & Download   |   [N / Esc] Decline", mx+24, my+175, 18, rl.Gold)
+			drawUIText(licInfo, mx+24, my+106, 15, rl.Lime)
+			drawUIText("[Y] Accept & Download   |   [N / Esc] Decline", mx+24, my+175, 18, rl.Gold)
 		}
 
 		if pendingDrop != nil {
 			mw, mh := int32(600), int32(210)
 			mx, my := (sw-mw)/2, (sh-mh)/2
-			rl.DrawRectangle(mx, my, mw, mh, rl.NewColor(14, 20, 30, 248))
-			rl.DrawRectangleLines(mx, my, mw, mh, rl.Lime)
-			rl.DrawText("IMPORTED .GLB (VALIDATED BY GLBGUARD)", mx+24, my+20, 19, rl.Lime)
-			rl.DrawText("File: "+pendingDrop.FileName, mx+24, my+52, 18, rl.RayWhite)
-			rl.DrawText("[1] Equip as My Live Avatar", mx+24, my+95, 18, rl.SkyBlue)
-			rl.DrawText("[2] Add to Prop Inventory & Place", mx+24, my+125, 18, rl.Gold)
-			rl.DrawText("[Esc] Cancel", mx+24, my+165, 16, rl.Gray)
+			drawGlassPanel(mx, my, mw, mh, rl.Lime, 248)
+			drawUITextShadow("IMPORTED .GLB (VALIDATED BY GLBGUARD)", mx+24, my+20, 19, rl.Lime)
+			drawUIText("File: "+pendingDrop.FileName, mx+24, my+52, 18, rl.RayWhite)
+			drawUIText("[1] Equip as My Live Avatar", mx+24, my+95, 18, rl.SkyBlue)
+			drawUIText("[2] Add to Prop Inventory & Place", mx+24, my+125, 18, rl.Gold)
+			drawUIText("[Esc] Cancel", mx+24, my+165, 16, rl.Gray)
 		}
 
 		if dirOpen {
 			mw, mh := int32(720), int32(430)
 			mx, my := (sw-mw)/2, (sh-mh)/2
-			rl.DrawRectangle(mx, my, mw, mh, rl.NewColor(16, 20, 30, 248))
-			rl.DrawRectangleLines(mx, my, mw, mh, rl.SkyBlue)
-			rl.DrawText("WORLD DIRECTORY (~/.vektorweb-client/worlds.toml)", mx+24, my+18, 19, rl.SkyBlue)
+			drawGlassPanel(mx, my, mw, mh, rl.SkyBlue, 246)
+			drawUITextShadow("WORLD DIRECTORY (~/.vektorweb-client/worlds.toml)", mx+24, my+18, 19, rl.SkyBlue)
 
 			dirStatusMu.RLock()
 			for i, w := range directory.Worlds {
@@ -3557,23 +3570,22 @@ func main() {
 				if isSel {
 					titleCol = rl.Gold
 				}
-				rl.DrawText(leftTitle, mx+42, rowY, 17, titleCol)
+				drawUIText(leftTitle, mx+42, rowY, 17, titleCol)
 
-				bw := rl.MeasureText(badgeTxt, 15)
-				rl.DrawText(badgeTxt, mx+mw-24-bw, rowY+2, 15, badgeCol)
-				rl.DrawText(truncateToWidth(w.URL, 14, mw-70), mx+42, rowY+19, 14, rl.Gray)
+				bw := uiTextWidth(badgeTxt, 15)
+				drawUIText(badgeTxt, mx+mw-24-bw, rowY+2, 15, badgeCol)
+				drawUIText(truncateToWidth(w.URL, 14, mw-70), mx+42, rowY+19, 14, rl.Gray)
 			}
 			dirStatusMu.RUnlock()
 
-			rl.DrawText("[1-8 / Enter] Hop  |  [F] Pin to #1  |  [R] Refresh  |  [Tab / Esc] Close", mx+24, my+mh-34, 15, rl.Gold)
+			drawUIText("[1-8 / Enter] Hop  |  [F] Pin to #1  |  [R] Refresh  |  [Tab / Esc] Close", mx+24, my+mh-34, 15, rl.Gold)
 		}
 
 		if helpOpen {
 			mw, mh := int32(720), int32(530)
 			mx, my := (sw-mw)/2, (sh-mh)/2
-			rl.DrawRectangle(mx, my, mw, mh, rl.NewColor(14, 18, 26, 248))
-			rl.DrawRectangleLines(mx, my, mw, mh, rl.Gold)
-			rl.DrawText("VEKTORWEB CONTROLS & SLASH COMMANDS", mx+26, my+18, 19, rl.Gold)
+			drawGlassPanel(mx, my, mw, mh, rl.Gold, 246)
+			drawUITextShadow("VEKTORWEB CONTROLS & SLASH COMMANDS", mx+26, my+18, 19, rl.Gold)
 			helpLines := []string{
 				"[I]              : Local Inventory ([R] to Transfer/Sell signed item)",
 				"Drag & Drop .glb : Equip avatar or import prop into inventory",
@@ -3588,12 +3600,99 @@ func main() {
 				"[F2] / [F3]      : Client Settings (FOV, Sens, Fog) / Online Peers List",
 			}
 			for i, hl := range helpLines {
-				rl.DrawText(hl, mx+26, my+int32(56+i*38), 16, rl.RayWhite)
+				drawUIText(hl, mx+26, my+int32(56+i*38), 16, rl.RayWhite)
 			}
 		}
 
 		rl.EndDrawing()
 	}
+}
+
+var (
+	uiFont    rl.Font
+	hasUIFont bool
+)
+
+func loadBestUIFont(baseDir string) (rl.Font, bool) {
+	candidates := []string{
+		filepath.Join(baseDir, "font.ttf"),
+		filepath.Join(baseDir, "font.otf"),
+		"/usr/share/fonts/TTF/Inter-Regular.ttf",
+		"/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
+		"/usr/share/fonts/TTF/DejaVuSans.ttf",
+		"/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+		"/usr/share/fonts/TTF/LiberationSans-Regular.ttf",
+		"/usr/share/fonts/TTF/Hack-Regular.ttf",
+		"/usr/share/fonts/noto/NotoSans-Regular.ttf",
+		"/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+		"/usr/share/fonts/Adwaita/AdwaitaSans-Regular.ttf",
+		"/usr/share/fonts/gnu-free/FreeSans.ttf",
+		"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+		"/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+		"/usr/local/share/fonts/dejavu/DejaVuSans.ttf",
+		"/usr/local/share/fonts/Liberation/LiberationSans-Regular.ttf",
+		"/usr/X11R6/lib/X11/fonts/TTF/DejaVuSans.ttf",
+		"C:\\Windows\\Fonts\\segoeui.ttf",
+		"C:\\Windows\\Fonts\\consola.ttf",
+	}
+	for _, p := range candidates {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			f := rl.LoadFontEx(p, 32, nil, 512)
+			if f.BaseSize > 0 && f.Texture.ID > 0 {
+				rl.SetTextureFilter(f.Texture, rl.FilterBilinear)
+				return f, true
+			}
+		}
+	}
+	return rl.GetFontDefault(), false
+}
+
+func uiTextWidth(text string, fontSize int32) int32 {
+	if hasUIFont {
+		sz := rl.MeasureTextEx(uiFont, text, float32(fontSize), 1.0)
+		return int32(math.Ceil(float64(sz.X)))
+	}
+	return rl.MeasureText(text, fontSize)
+}
+
+func drawUIText(text string, x, y, fontSize int32, col rl.Color) {
+	if hasUIFont {
+		rl.DrawTextEx(uiFont, text, rl.NewVector2(float32(x), float32(y)), float32(fontSize), 1.0, col)
+		return
+	}
+	rl.DrawText(text, x, y, fontSize, col)
+}
+
+func drawUITextShadow(text string, x, y, fontSize int32, col rl.Color) {
+	drawUIText(text, x+1, y+1, fontSize, rl.NewColor(4, 6, 11, 210))
+	drawUIText(text, x, y, fontSize, col)
+}
+
+func drawGlassPanel(x, y, w, h int32, accent rl.Color, bgAlpha uint8) {
+	// Soft drop shadow for depth separation over 3D geometry
+	shadowRec := rl.NewRectangle(float32(x+3), float32(y+5), float32(w), float32(h))
+	rl.DrawRectangleRounded(shadowRec, 0.035, 10, rl.NewColor(3, 5, 10, 130))
+
+	rec := rl.NewRectangle(float32(x), float32(y), float32(w), float32(h))
+	rl.DrawRectangleRounded(rec, 0.035, 10, rl.NewColor(13, 17, 27, bgAlpha))
+	rl.DrawRectangleRoundedLinesEx(rec, 0.035, 10, 1.25, rl.NewColor(66, 86, 122, 220))
+	// Crisp top accent bar
+	rl.DrawRectangle(x+14, y+1, w-28, 2, accent)
+}
+
+func drawModalBackdrop(sw, sh int32) {
+	rl.DrawRectangle(0, 0, sw, sh, rl.NewColor(5, 7, 13, 145))
+}
+
+func drawKeyBadge(text string, x, y, fontSize int32, fg, bg, border rl.Color) int32 {
+	tw := uiTextWidth(text, fontSize)
+	bw := tw + 14
+	bh := fontSize + 6
+	rec := rl.NewRectangle(float32(x), float32(y), float32(bw), float32(bh))
+	rl.DrawRectangleRounded(rec, 0.28, 6, bg)
+	rl.DrawRectangleRoundedLinesEx(rec, 0.28, 6, 1.0, border)
+	drawUIText(text, x+7, y+3, fontSize, fg)
+	return bw
 }
 
 func minInt(a, b int) int {
@@ -3615,11 +3714,6 @@ func clampFloat32(v, minV, maxV float32) float32 {
 
 func setClipboardSafe(text string) bool {
 	rl.SetClipboardText(text)
-	// Verify if GLFW/raylib actually retained the text
-	if got := rl.GetClipboardText(); got == text {
-		return true
-	}
-	// Fallback to native OS clipboard utilities (Wayland, X11, macOS, Windows)
 	var candidates [][]string
 	switch runtime.GOOS {
 	case "windows":
@@ -3642,14 +3736,53 @@ func setClipboardSafe(text string) bool {
 			continue
 		}
 		cmd := exec.Command(bin, args[1:]...)
-		cmd.Stdin = strings.NewReader(text)
-		if err := cmd.Start(); err == nil {
-			// Reap child in background (xclip/wl-copy stay alive to serve X11/Wayland paste requests)
-			go func() { _ = cmd.Wait() }()
-			return true
+		stdin, err := cmd.StdinPipe()
+		if err != nil {
+			continue
+		}
+		if err := cmd.Start(); err != nil {
+			_ = stdin.Close()
+			continue
+		}
+		_, _ = io.WriteString(stdin, text)
+		_ = stdin.Close()
+		go func() { _ = cmd.Wait() }()
+		return true
+	}
+	return rl.GetClipboardText() == text
+}
+
+func getClipboardSafe() string {
+	if got := rl.GetClipboardText(); got != "" {
+		return got
+	}
+	var candidates [][]string
+	switch runtime.GOOS {
+	case "windows":
+		candidates = [][]string{{"powershell", "-NoProfile", "-Command", "Get-Clipboard"}}
+	case "darwin":
+		candidates = [][]string{{"pbpaste"}}
+	default:
+		if os.Getenv("WAYLAND_DISPLAY") != "" {
+			candidates = append(candidates, []string{"wl-paste", "-n"})
+		}
+		candidates = append(candidates,
+			[]string{"xclip", "-selection", "clipboard", "-o"},
+			[]string{"xsel", "--clipboard", "--output"},
+			[]string{"wl-paste", "-n"},
+		)
+	}
+	for _, args := range candidates {
+		bin, err := exec.LookPath(args[0])
+		if err != nil {
+			continue
+		}
+		out, err := exec.Command(bin, args[1:]...).Output()
+		if err == nil && len(out) > 0 {
+			return string(out)
 		}
 	}
-	return false
+	return ""
 }
 
 func sanitizeFileName(raw string) string {
@@ -3679,7 +3812,7 @@ func wrapChatLine(text string, fontSize, maxWidth int32) []string {
 	if text == "" {
 		return nil
 	}
-	if maxWidth <= 40 || rl.MeasureText(text, fontSize) <= maxWidth {
+	if maxWidth <= 40 || uiTextWidth(text, fontSize) <= maxWidth {
 		return []string{text}
 	}
 	var out []string
@@ -3690,7 +3823,7 @@ func wrapChatLine(text string, fontSize, maxWidth int32) []string {
 		if cur != "" {
 			candidate = cur + " " + w
 		}
-		if rl.MeasureText(candidate, fontSize) <= maxWidth {
+		if uiTextWidth(candidate, fontSize) <= maxWidth {
 			cur = candidate
 			continue
 		}
@@ -3699,11 +3832,11 @@ func wrapChatLine(text string, fontSize, maxWidth int32) []string {
 			cur = ""
 		}
 		// Break oversized single tokens (such as 64-char pubkeys or URLs) by rune width
-		if rl.MeasureText(w, fontSize) > maxWidth {
+		if uiTextWidth(w, fontSize) > maxWidth {
 			var chunk strings.Builder
 			for _, r := range w {
 				test := chunk.String() + string(r)
-				if rl.MeasureText(test, fontSize) > maxWidth && chunk.Len() > 0 {
+				if uiTextWidth(test, fontSize) > maxWidth && chunk.Len() > 0 {
 					out = append(out, chunk.String())
 					chunk.Reset()
 				}
@@ -3721,13 +3854,13 @@ func wrapChatLine(text string, fontSize, maxWidth int32) []string {
 }
 
 func truncateToWidth(text string, fontSize, maxWidth int32) string {
-	if text == "" || maxWidth <= 24 || rl.MeasureText(text, fontSize) <= maxWidth {
+	if text == "" || maxWidth <= 24 || uiTextWidth(text, fontSize) <= maxWidth {
 		return text
 	}
 	runes := []rune(text)
 	for i := len(runes) - 1; i >= 1; i-- {
 		cand := string(runes[:i]) + "..."
-		if rl.MeasureText(cand, fontSize) <= maxWidth {
+		if uiTextWidth(cand, fontSize) <= maxWidth {
 			return cand
 		}
 	}
@@ -3736,13 +3869,13 @@ func truncateToWidth(text string, fontSize, maxWidth int32) string {
 
 func fitInputTail(prefix, input, suffix string, fontSize, maxWidth int32) string {
 	full := prefix + input + suffix
-	if maxWidth <= 40 || rl.MeasureText(full, fontSize) <= maxWidth {
+	if maxWidth <= 40 || uiTextWidth(full, fontSize) <= maxWidth {
 		return full
 	}
 	runes := []rune(input)
 	for i := 1; i <= len(runes); i++ {
 		cand := prefix + "..." + string(runes[i:]) + suffix
-		if rl.MeasureText(cand, fontSize) <= maxWidth {
+		if uiTextWidth(cand, fontSize) <= maxWidth {
 			return cand
 		}
 	}
@@ -3750,12 +3883,15 @@ func fitInputTail(prefix, input, suffix string, fontSize, maxWidth int32) string
 }
 
 func drawMiniRadar(cx, cy, radius int32, cam rl.Camera3D, lookVec rl.Vector3, ns *NetState, portals []WorldPortal) {
-	rl.DrawCircle(cx, cy, float32(radius), rl.NewColor(14, 18, 28, 210))
-	rl.DrawCircleLines(cx, cy, float32(radius), rl.NewColor(65, 85, 115, 220))
-	rl.DrawCircle(cx, cy, 3, rl.Lime)
+	rl.DrawCircle(cx, cy, float32(radius), rl.NewColor(11, 15, 24, 220))
+	rl.DrawCircleLines(cx, cy, float32(radius), rl.NewColor(75, 105, 145, 235))
+	rl.DrawCircleLines(cx, cy, float32(radius)*0.55, rl.NewColor(45, 62, 88, 160))
+	rl.DrawLine(cx-radius+6, cy, cx+radius-6, cy, rl.NewColor(40, 55, 78, 140))
+	rl.DrawLine(cx, cy-radius+6, cx, cy+radius-6, rl.NewColor(40, 55, 78, 140))
+	rl.DrawCircle(cx, cy, 3.5, rl.Lime)
 
 	flatLook := rl.Vector3Normalize(rl.NewVector3(lookVec.X, 0, lookVec.Z))
-	rl.DrawLine(cx, cy, cx+int32(flatLook.X*14), cy+int32(flatLook.Z*14), rl.Lime)
+	rl.DrawLine(cx, cy, cx+int32(flatLook.X*18), cy+int32(flatLook.Z*18), rl.Lime)
 
 	for _, portal := range portals {
 		if len(portal.Pos) != 3 {
