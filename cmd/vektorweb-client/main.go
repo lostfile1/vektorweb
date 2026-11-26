@@ -100,6 +100,9 @@ type OutfitPreset struct {
 
 type ClientSettings struct {
 	Nick         string                  `toml:"nick"`
+	AvatarHash   string                  `toml:"avatar_hash"`
+	AvatarScale  float32                 `toml:"avatar_scale"`
+	LastWorld    string                  `toml:"last_world"`
 	FOV          float32                 `toml:"fov"`
 	MouseSens    float32                 `toml:"mouse_sens"`
 	VoiceVolume  float32                 `toml:"voice_volume"`
@@ -113,6 +116,7 @@ type ClientSettings struct {
 
 func defaultClientSettings() ClientSettings {
 	return ClientSettings{
+		AvatarScale:  1.0,
 		FOV:          72.0,
 		MouseSens:    0.0025,
 		VoiceVolume:  1.0,
@@ -129,6 +133,9 @@ func loadClientSettings(path string) ClientSettings {
 	cfg := defaultClientSettings()
 	if b, err := os.ReadFile(path); err == nil {
 		_, _ = toml.Decode(string(b), &cfg)
+	}
+	if cfg.AvatarScale < 0.25 || cfg.AvatarScale > 4.0 {
+		cfg.AvatarScale = 1.0
 	}
 	if cfg.FOV < 50 || cfg.FOV > 110 {
 		cfg.FOV = 72.0
@@ -148,6 +155,9 @@ func loadClientSettings(path string) ClientSettings {
 func saveClientSettings(path string, cfg ClientSettings) {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "nick = %q\n", cfg.Nick)
+	fmt.Fprintf(&sb, "avatar_hash = %q\n", cfg.AvatarHash)
+	fmt.Fprintf(&sb, "avatar_scale = %.2f\n", cfg.AvatarScale)
+	fmt.Fprintf(&sb, "last_world = %q\n", cfg.LastWorld)
 	fmt.Fprintf(&sb, "fov = %.1f\n", cfg.FOV)
 	fmt.Fprintf(&sb, "mouse_sens = %.4f\n", cfg.MouseSens)
 	fmt.Fprintf(&sb, "voice_volume = %.2f\n", cfg.VoiceVolume)
@@ -1254,11 +1264,18 @@ func main() {
 	noMicFlag := flag.Bool("nomic", false, "Disable microphone capture (useful for second local test client)")
 	flag.Parse()
 
+	worldExplicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "world" {
+			worldExplicit = true
+		}
+	})
+
 	targetWorld := *worldURL
 	if flag.NArg() > 0 && flag.Arg(0) != "" {
 		targetWorld = flag.Arg(0)
+		worldExplicit = true
 	}
-	targetWorld = normalizeWorldURL(targetWorld)
 
 	home, _ := os.UserHomeDir()
 	dirName := ".vektorweb-client"
@@ -1277,6 +1294,15 @@ func main() {
 
 	settingsPath := filepath.Join(baseDir, "settings.toml")
 	cfg := loadClientSettings(settingsPath)
+
+	if !worldExplicit {
+		if savedW := strings.TrimSpace(cfg.LastWorld); savedW != "" && normalizeWorldURL(savedW) != "local://sandbox" {
+			targetWorld = savedW
+		} else if preDir := loadWorldDirectory(filepath.Join(baseDir, "worlds.toml"), ""); len(preDir.Worlds) > 0 && strings.TrimSpace(preDir.Worlds[0].URL) != "" {
+			targetWorld = strings.TrimSpace(preDir.Worlds[0].URL)
+		}
+	}
+	targetWorld = normalizeWorldURL(targetWorld)
 
 	kp, err := identity.LoadOrCreate(baseDir)
 	if err != nil {
@@ -1314,6 +1340,9 @@ func main() {
 	if err != nil {
 		log.Printf("Could not reach %s (%v) -> booting into local://sandbox", targetWorld, err)
 		activeWorld, _ = loadWorldFromURL("local://sandbox", cacheDir)
+	} else if activeWorld.URL != "" && activeWorld.URL != "local://sandbox" && cfg.LastWorld != activeWorld.URL {
+		cfg.LastWorld = activeWorld.URL
+		saveClientSettings(settingsPath, cfg)
 	}
 
 	maxAvMB := activeWorld.Manifest.Rules.MaxAvatarMB
@@ -1348,33 +1377,66 @@ func main() {
 		}
 	}
 
-	avPath := *avatarFile
-	if avPath == "" {
-		avPath = defaultAvPath
-	}
 	localAvHash := "none"
 	var localAvBytes []byte
-	if b, err := os.ReadFile(avPath); err == nil {
-		if err := glbguard.ValidateGLB(b, maxAvMB*1024*1024); err == nil {
-			h := identity.FileSHA256(b)
-			licOk := true
-			if lic, err := identity.LoadAssetLicense(licensePathForGLB(avPath)); err == nil {
+	tryEquipAvatarBytes := func(b []byte, sidecarPath string) bool {
+		if err := glbguard.ValidateGLB(b, maxAvMB*1024*1024); err != nil {
+			return false
+		}
+		h := identity.FileSHA256(b)
+		if sidecarPath != "" {
+			if lic, err := identity.LoadAssetLicense(sidecarPath); err == nil {
 				if err := lic.Verify(h, kp.PubHex()); err != nil {
 					log.Printf("Avatar license rejected: %v", err)
-					licOk = false
-				} else {
-					_ = os.Remove(worldOnlyMarkerPath(cacheDir, h))
+					return false
 				}
-			} else if isWorldOnlyAsset(cacheDir, h) {
-				log.Printf("Avatar rejected: display-only world/peer asset")
-				licOk = false
+				_ = os.Remove(worldOnlyMarkerPath(cacheDir, h))
 			}
-			if licOk {
-				localAvHash = h
-				localAvBytes = b
-				localAssets[localAvHash] = b
-				_ = os.WriteFile(filepath.Join(cacheDir, localAvHash+".glb"), b, 0644)
+		}
+		if lic, err := identity.LoadAssetLicense(filepath.Join(cacheDir, h+".license.json")); err == nil {
+			if err := lic.Verify(h, kp.PubHex()); err != nil {
+				log.Printf("Cached avatar license rejected: %v", err)
+				return false
 			}
+			_ = os.Remove(worldOnlyMarkerPath(cacheDir, h))
+		} else if isWorldOnlyAsset(cacheDir, h) {
+			log.Printf("Avatar rejected: display-only world/peer asset")
+			return false
+		}
+		localAvHash = h
+		localAvBytes = b
+		localAssets[localAvHash] = b
+		_ = os.WriteFile(filepath.Join(cacheDir, localAvHash+".glb"), b, 0644)
+		return true
+	}
+
+	if *avatarFile != "" {
+		if b, err := os.ReadFile(*avatarFile); err == nil {
+			if tryEquipAvatarBytes(b, licensePathForGLB(*avatarFile)) && cfg.AvatarHash != localAvHash {
+				cfg.AvatarHash = localAvHash
+				saveClientSettings(settingsPath, cfg)
+			}
+		}
+	} else {
+		savedAv := strings.ToLower(strings.TrimSpace(cfg.AvatarHash))
+		if isValidHex64(savedAv) {
+			for _, it := range avatarInv {
+				if strings.EqualFold(it.Hash, savedAv) {
+					if b, ok := localAssets[it.Hash]; ok && tryEquipAvatarBytes(b, licensePathForGLB(it.Path)) {
+						break
+					}
+				}
+			}
+			if localAvHash == "none" {
+				if b, err := os.ReadFile(filepath.Join(cacheDir, savedAv+".glb")); err == nil {
+					_ = tryEquipAvatarBytes(b, "")
+				}
+			}
+		}
+	}
+	if localAvHash == "none" {
+		if b, err := os.ReadFile(defaultAvPath); err == nil {
+			_ = tryEquipAvatarBytes(b, licensePathForGLB(defaultAvPath))
 		}
 	}
 
@@ -1539,6 +1601,9 @@ func main() {
 		}
 	}()
 
+	invPreviewRT := rl.LoadRenderTexture(260, 260)
+	defer rl.UnloadRenderTexture(invPreviewRT)
+
 	loadedModels := make(map[string]rl.Model)
 	loadedAnims := make(map[string]*ModelAnimSet)
 	for _, pe := range propInv {
@@ -1636,6 +1701,10 @@ func main() {
 					visitedWorlds = visitedWorlds[len(visitedWorlds)-16:]
 				}
 			}
+		}
+		if activeWorld.URL != "" && activeWorld.URL != "local://sandbox" && cfg.LastWorld != activeWorld.URL {
+			cfg.LastWorld = activeWorld.URL
+			saveClientSettings(settingsPath, cfg)
 		}
 		startRelayForWorld(activeWorld)
 		seedBakedProps(activeWorld)
@@ -1745,6 +1814,8 @@ func main() {
 	luaHUD := ""
 	lastSync := time.Now()
 	lastJanitor := time.Now()
+	lastActivity := time.Now()
+	isAFK := false
 
 	rl.SetExitKey(0)
 	cursorLocked := true
@@ -1753,6 +1824,20 @@ func main() {
 	for !rl.WindowShouldClose() {
 		sw := int32(rl.GetScreenWidth())
 		sh := int32(rl.GetScreenHeight())
+
+		md := rl.GetMouseDelta()
+		if rl.GetKeyPressed() != 0 || rl.GetCharPressed() != 0 ||
+			rl.IsMouseButtonPressed(rl.MouseButtonLeft) || rl.IsMouseButtonPressed(rl.MouseButtonRight) ||
+			rl.GetMouseWheelMove() != 0 || md.X != 0 || md.Y != 0 {
+			lastActivity = time.Now()
+			if isAFK {
+				isAFK = false
+				netState.addChat("[SYS]: Welcome back (AFK cleared)")
+			}
+		} else if !isAFK && time.Since(lastActivity) >= 3*time.Minute {
+			isAFK = true
+			netState.addChat("[SYS]: You are now marked [AFK] after 3m of inactivity")
+		}
 
 		netState.mu.Lock()
 		hasIncomingOffer := len(netState.incomingXfers) > 0
@@ -1903,12 +1988,10 @@ func main() {
 			if rl.IsKeyPressed(rl.KeyOne) {
 				destP := filepath.Join(avatarsDir, pendingDrop.FileName)
 				_ = os.WriteFile(destP, pendingDrop.Bytes, 0644)
-				_ = os.WriteFile(defaultAvPath, pendingDrop.Bytes, 0644)
 				cachedP := filepath.Join(cacheDir, pendingDrop.Hash+".glb")
 				_ = os.WriteFile(cachedP, pendingDrop.Bytes, 0644)
 				if lic, err := identity.LoadAssetLicense(filepath.Join(cacheDir, pendingDrop.Hash+".license.json")); err == nil {
 					_ = identity.SaveAssetLicense(licensePathForGLB(destP), lic)
-					_ = identity.SaveAssetLicense(licensePathForGLB(defaultAvPath), lic)
 				}
 
 				if _, exists := loadedModels[pendingDrop.Hash]; !exists {
@@ -1926,8 +2009,10 @@ func main() {
 				netState.mu.Unlock()
 				localAvHash = pendingDrop.Hash
 
+				cfg.AvatarHash = pendingDrop.Hash
+				saveClientSettings(settingsPath, cfg)
 				avatarInv = scanInventoryFolder(avatarsDir, "avatar", cacheDir, kp.PubHex(), maxAvMB*1024*1024, localAssets)
-				netState.addChat("[AVATAR]: Equipped " + pendingDrop.FileName + "!")
+				netState.addChat("[AVATAR]: Equipped & saved " + pendingDrop.FileName + "!")
 				pendingDrop = nil
 			} else if rl.IsKeyPressed(rl.KeyTwo) {
 				destP := filepath.Join(itemsDir, pendingDrop.FileName)
@@ -2239,12 +2324,12 @@ func main() {
 				helpOpen = false
 			}
 		} else if settingsOpen {
-			// 0: FOV, 1: Mouse Sens, 2: Voice Volume, 3: Mini-Radar, 4: Nameplates, 5: Crosshair, 6: Distance Fog
+			// 0: FOV, 1: Mouse Sens, 2: Voice Volume, 3: Avatar Scale, 4: Mini-Radar, 5: Nameplates, 6: Crosshair, 7: Distance Fog
 			if rl.IsKeyPressed(rl.KeyDown) || rl.IsKeyPressed(rl.KeyS) {
-				settingsCursor = (settingsCursor + 1) % 7
+				settingsCursor = (settingsCursor + 1) % 8
 			}
 			if rl.IsKeyPressed(rl.KeyUp) || rl.IsKeyPressed(rl.KeyW) {
-				settingsCursor = (settingsCursor + 6) % 7
+				settingsCursor = (settingsCursor + 7) % 8
 			}
 			left := rl.IsKeyPressed(rl.KeyLeft) || rl.IsKeyPressed(rl.KeyA)
 			right := rl.IsKeyPressed(rl.KeyRight) || rl.IsKeyPressed(rl.KeyD) || rl.IsKeyPressed(rl.KeyEnter)
@@ -2262,12 +2347,14 @@ func main() {
 				case 2:
 					cfg.VoiceVolume = clampFloat32(cfg.VoiceVolume+dir*0.1, 0.0, 2.0)
 				case 3:
-					cfg.ShowRadar = !cfg.ShowRadar
+					cfg.AvatarScale = clampFloat32(cfg.AvatarScale+dir*0.1, 0.25, 4.0)
 				case 4:
-					cfg.ShowTags = !cfg.ShowTags
+					cfg.ShowRadar = !cfg.ShowRadar
 				case 5:
-					cfg.ShowCross = !cfg.ShowCross
+					cfg.ShowTags = !cfg.ShowTags
 				case 6:
+					cfg.ShowCross = !cfg.ShowCross
+				case 7:
 					cfg.EnableFog = !cfg.EnableFog
 					setModelFog(worldModel, cfg.EnableFog)
 					for _, m := range loadedModels {
@@ -2449,6 +2536,8 @@ func main() {
 								if b, err := os.ReadFile(defaultAvPath); err == nil {
 									h := identity.FileSHA256(b)
 									localAvHash = h
+									cfg.AvatarHash = h
+									saveClientSettings(settingsPath, cfg)
 									netState.mu.Lock()
 									netState.localAvHash = h
 									netState.localAvBytes = b
@@ -2492,7 +2581,9 @@ func main() {
 						netState.localAvBytes = localAssets[chosen.Hash]
 						netState.mu.Unlock()
 						localAvHash = chosen.Hash
-						netState.addChat("[AVATAR]: Equipped " + chosen.Name)
+						cfg.AvatarHash = chosen.Hash
+						saveClientSettings(settingsPath, cfg)
+						netState.addChat("[AVATAR]: Equipped & saved " + chosen.Name)
 					} else {
 						propIdx = invCursor % len(propInv)
 						if _, ok := loadedModels[chosen.Hash]; !ok {
@@ -2907,10 +2998,14 @@ func main() {
 			netState.mu.RLock()
 			curNick := netState.nick
 			netState.mu.RUnlock()
+			txNick := curNick
+			if isAFK {
+				txNick = "[AFK] " + curNick
+			}
 
 			_ = netState.sendJSON(WireMsg{
 				Type:       "STATE",
-				Nick:       curNick,
+				Nick:       txNick,
 				Pos:        []float32{bodyHeadPos.X, bodyHeadPos.Y, bodyHeadPos.Z},
 				Yaw:        bodyYaw,
 				AvatarHash: localAvHash,
@@ -2973,10 +3068,14 @@ func main() {
 
 		if thirdPerson && walkMode {
 			feetPos := rl.NewVector3(bodyHeadPos.X, bodyHeadPos.Y-1.65, bodyHeadPos.Z)
-			rl.DrawCircle3D(rl.NewVector3(feetPos.X, feetPos.Y+0.02, feetPos.Z), 0.42, rl.NewVector3(1, 0, 0), 90, rl.Fade(rl.SkyBlue, 0.7))
+			avSc := cfg.AvatarScale
+			if avSc <= 0 {
+				avSc = 1.0
+			}
+			rl.DrawCircle3D(rl.NewVector3(feetPos.X, feetPos.Y+0.02, feetPos.Z), 0.42*avSc, rl.NewVector3(1, 0, 0), 90, rl.Fade(rl.SkyBlue, 0.7))
 			if mod, ok := loadedModels[localAvHash]; ok {
-				drawPos := rl.NewVector3(feetPos.X, feetPos.Y+modelFeetOffsetY(mod), feetPos.Z)
-				rl.DrawModelEx(mod, drawPos, rl.NewVector3(0, 1, 0), bodyYaw, rl.NewVector3(1, 1, 1), rl.White)
+				drawPos := rl.NewVector3(feetPos.X, feetPos.Y+modelFeetOffsetY(mod)*avSc, feetPos.Z)
+				rl.DrawModelEx(mod, drawPos, rl.NewVector3(0, 1, 0), bodyYaw, rl.NewVector3(avSc, avSc, avSc), rl.White)
 			} else {
 				rl.DrawCapsule(
 					rl.NewVector3(feetPos.X, feetPos.Y+0.35, feetPos.Z),
@@ -3363,7 +3462,7 @@ func main() {
 
 		if invOpen {
 			drawModalBackdrop(sw, sh)
-			mw, mh := int32(720), int32(450)
+			mw, mh := int32(920), int32(465)
 			mx, my := (sw-mw)/2, (sh-mh)/2
 			drawGlassPanel(mx, my, mw, mh, rl.SkyBlue, 246)
 			drawUITextShadow("LOCAL INVENTORY & KEY-SIGNED TRANSFERS (~/.vektorweb-client/)", mx+24, my+18, 18, rl.SkyBlue)
@@ -3380,16 +3479,74 @@ func main() {
 			drawUIText(fmt.Sprintf("[1] Props (%d)", len(propInv)), mx+24, my+50, 18, propCol)
 			drawUIText(fmt.Sprintf("[2] Avatars (%d)", len(avatarInv)), mx+195, my+50, 18, avCol)
 
+			// Render rotating 3D preview of currently highlighted item into invPreviewRT
+			if len(activeList) > 0 && invPreviewRT.ID > 0 {
+				selItem := activeList[invCursor%len(activeList)]
+				px, py, pw, ph := mx+mw-286, my+68, int32(260), int32(260)
+				rl.BeginTextureMode(invPreviewRT)
+				rl.ClearBackground(rl.NewColor(16, 22, 34, 255))
+				if mod, ok := loadedModels[selItem.Hash]; ok && mod.MeshCount > 0 {
+					bb := rl.GetModelBoundingBox(mod)
+					cx := (bb.Min.X + bb.Max.X) * 0.5
+					cy := (bb.Min.Y + bb.Max.Y) * 0.5
+					cz := (bb.Min.Z + bb.Max.Z) * 0.5
+					extX := bb.Max.X - bb.Min.X
+					extY := bb.Max.Y - bb.Min.Y
+					extZ := bb.Max.Z - bb.Min.Z
+					maxDim := extX
+					if extY > maxDim {
+						maxDim = extY
+					}
+					if extZ > maxDim {
+						maxDim = extZ
+					}
+					if maxDim < 0.25 || math.IsNaN(float64(maxDim)) || math.IsInf(float64(maxDim), 0) {
+						maxDim = 1.5
+					}
+					camDist := maxDim * 1.85
+					prevCam := rl.Camera3D{
+						Position:   rl.NewVector3(0, maxDim*0.35, camDist),
+						Target:     rl.NewVector3(0, 0, 0),
+						Up:         rl.NewVector3(0, 1, 0),
+						Fovy:       45.0,
+						Projection: rl.CameraPerspective,
+					}
+					if cfg.EnableFog {
+						setModelFog(mod, false)
+					}
+					spinYaw := float32(math.Mod(rl.GetTime()*42.0, 360.0))
+					rl.BeginMode3D(prevCam)
+					rl.DrawGrid(6, maxDim*0.35)
+					rl.DrawModelEx(mod, rl.NewVector3(-cx, -cy, -cz), rl.NewVector3(0, 1, 0), spinYaw, rl.NewVector3(1, 1, 1), rl.White)
+					rl.EndMode3D()
+					if cfg.EnableFog {
+						setModelFog(mod, true)
+					}
+				}
+				rl.EndTextureMode()
+
+				srcRec := rl.NewRectangle(0, 0, float32(invPreviewRT.Texture.Width), -float32(invPreviewRT.Texture.Height))
+				dstRec := rl.NewRectangle(float32(px), float32(py), float32(pw), float32(ph))
+				rl.DrawTexturePro(invPreviewRT.Texture, srcRec, dstRec, rl.Vector2Zero(), 0, rl.White)
+				rl.DrawRectangleLines(px, py, pw, ph, rl.NewColor(56, 189, 248, 220))
+				drawUIText(truncateToWidth(selItem.Name, 14, pw), px, py+ph+8, 14, rl.SkyBlue)
+				if selItem.HasBounds {
+					drawUIText(fmt.Sprintf("Size: %.2f x %.2f x %.2fm", selItem.Bounds[0], selItem.Bounds[1], selItem.Bounds[2]), px, py+ph+26, 13, rl.LightGray)
+				}
+				drawUIText("SHA: "+selItem.Hash[:16]+"...", px, py+ph+44, 13, rl.Gray)
+			}
+
 			if transferModalOpen && len(activeList) > 0 {
 				chosen := activeList[invCursor%len(activeList)]
-				drawUIText("TRANSFER ITEM: "+chosen.Name, mx+24, my+88, 18, rl.Gold)
-				lockLabel := "VENDOR-LOCKED (Recipient CANNOT resell/redistribute)"
+				leftColW := mw - 330
+				drawUIText(truncateToWidth("TRANSFER ITEM: "+chosen.Name, 18, leftColW), mx+24, my+88, 18, rl.Gold)
+				lockLabel := "VENDOR-LOCKED (No resale)"
 				lockCol := rl.SkyBlue
 				if transferAllowResale {
-					lockLabel = "TRANSFERABLE (Recipient MAY transfer to others)"
+					lockLabel = "TRANSFERABLE (Resale allowed)"
 					lockCol = rl.Lime
 				}
-				drawUIText("[L] License Mode: "+lockLabel, mx+24, my+116, 16, lockCol)
+				drawUIText(truncateToWidth("[L] Mode: "+lockLabel, 16, leftColW), mx+24, my+116, 16, lockCol)
 
 				netState.mu.RLock()
 				var onlinePeers []*RemotePeer
@@ -3414,7 +3571,8 @@ func main() {
 							prefix = "-> "
 							col = rl.Gold
 						}
-						drawUIText(fmt.Sprintf("%s%s (%s...)", prefix, formatPeerTag(p.Nick, p.PubKey), p.PubKey[:12]), mx+24, my+int32(178+i*28), 17, col)
+						rowPeer := fmt.Sprintf("%s%s (%s...)", prefix, formatPeerTag(p.Nick, p.PubKey), p.PubKey[:12])
+						drawUIText(truncateToWidth(rowPeer, 17, leftColW), mx+24, my+int32(178+i*28), 17, col)
 					}
 				}
 				drawUIText("[Up/Down] Recipient | [L] Toggle Vendor-Lock | [Enter] Sign & Send | [Esc] Back", mx+24, my+mh-34, 15, rl.Gray)
@@ -3441,7 +3599,7 @@ func main() {
 							meta += fmt.Sprintf(" | %.2fx%.2fx%.2fm", item.Bounds[0], item.Bounds[1], item.Bounds[2])
 						}
 						rowTxt := fmt.Sprintf("%s%s (%s) [%s]%s%s", prefix, item.Name, item.Hash[:6], meta, item.StatusTag, equipped)
-						drawUIText(truncateToWidth(rowTxt, 15, mw-48), mx+24, my+int32(88+i*32), 15, col)
+						drawUIText(truncateToWidth(rowTxt, 15, mw-330), mx+24, my+int32(88+i*32), 15, col)
 					}
 				}
 				drawUIText("[Up/Dn] Select | [Enter] Equip/Arm | [R] Transfer | [D] Delete | [I/Esc] Close", mx+24, my+mh-34, 15, rl.Gray)
@@ -3450,7 +3608,7 @@ func main() {
 
 		if settingsOpen {
 			drawModalBackdrop(sw, sh)
-			mw, mh := int32(580), int32(375)
+			mw, mh := int32(580), int32(410)
 			mx, my := (sw-mw)/2, (sh-mh)/2
 			drawGlassPanel(mx, my, mw, mh, rl.SkyBlue, 246)
 			drawUITextShadow("CLIENT SETTINGS (Saved to settings.toml)", mx+24, my+18, 19, rl.SkyBlue)
@@ -3459,6 +3617,7 @@ func main() {
 				fmt.Sprintf("Field of View (FOV) : %.0f deg", cfg.FOV),
 				fmt.Sprintf("Mouse Sensitivity   : %.4f", cfg.MouseSens),
 				fmt.Sprintf("Voice Volume        : %.0f%%", cfg.VoiceVolume*100),
+				fmt.Sprintf("3rd-Person Av Scale : %.2fx", cfg.AvatarScale),
 				fmt.Sprintf("Mini-Radar HUD      : %v", cfg.ShowRadar),
 				fmt.Sprintf("3D Nameplates       : %v", cfg.ShowTags),
 				fmt.Sprintf("Center Crosshair    : %v", cfg.ShowCross),
@@ -4374,6 +4533,7 @@ func handleChatCommand(
 		}
 		curN := ns.nick
 		curH := ns.localAvHash
+		cfg.AvatarHash = curH
 		pos := ns.localPos
 		ns.mu.Unlock()
 		saveClientSettings(settingsPath, *cfg)
@@ -4475,6 +4635,7 @@ func runRelaySession(ctx context.Context, conn *websocket.Conn, relayHost string
 
 	ns.mu.RLock()
 	curNick := ns.nick
+	curAvHash := ns.localAvHash
 	ns.mu.RUnlock()
 
 	sig := kp.SignChallenge(challenge.Nonce, challenge.Timestamp, relayHost)
@@ -4487,7 +4648,7 @@ func runRelaySession(ctx context.Context, conn *websocket.Conn, relayHost string
 		PubKey:       kp.PubHex(),
 		Nick:         curNick,
 		Signature:    sig,
-		AvatarHash:   ns.localAvHash,
+		AvatarHash:   curAvHash,
 	}
 	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if err := conn.WriteJSON(reply); err != nil {
