@@ -970,8 +970,8 @@ func loadWorldFromURL(rawURL, cacheDir string) (*LoadedWorld, error) {
 		m.World.Title = "Local Offline Sandbox"
 		m.World.Spawn = []float32{0, 2.0, 10.0}
 		m.Rules.PlacementMode = "ephemeral"
-		m.Rules.MaxAvatarMB = 15
-		m.Rules.MaxItemMB = 5
+		m.Rules.MaxAvatarMB = 24
+		m.Rules.MaxItemMB = 20
 		return &LoadedWorld{URL: rawURL, Manifest: m, EnvCacheGLB: cached}, nil
 	}
 
@@ -1609,11 +1609,17 @@ func main() {
 
 	maxAvMB := activeWorld.Manifest.Rules.MaxAvatarMB
 	if maxAvMB <= 0 {
-		maxAvMB = 15
+		maxAvMB = 24
+	}
+	if maxAvMB > 24 {
+		maxAvMB = 24
 	}
 	maxItemMB := activeWorld.Manifest.Rules.MaxItemMB
 	if maxItemMB <= 0 {
-		maxItemMB = 5
+		maxItemMB = 20
+	}
+	if maxItemMB > 24 {
+		maxItemMB = 24
 	}
 
 	localAssets := make(map[string][]byte)
@@ -1949,12 +1955,18 @@ func main() {
 		if activeWorld.Manifest.Rules.MaxAvatarMB > 0 {
 			maxAvMB = activeWorld.Manifest.Rules.MaxAvatarMB
 		} else {
-			maxAvMB = 15
+			maxAvMB = 24
+		}
+		if maxAvMB > 24 {
+			maxAvMB = 24
 		}
 		if activeWorld.Manifest.Rules.MaxItemMB > 0 {
 			maxItemMB = activeWorld.Manifest.Rules.MaxItemMB
 		} else {
-			maxItemMB = 5
+			maxItemMB = 20
+		}
+		if maxItemMB > 24 {
+			maxItemMB = 24
 		}
 		netState.mu.Lock()
 		netState.maxAssetB = maxAvMB * 1024 * 1024
@@ -4179,13 +4191,17 @@ func main() {
 				if len(activeList) == 0 {
 					drawUIText("No .glb files found. Drag & drop a .glb onto the window!", mx+24, my+98, 17, rl.LightGray)
 				} else {
-					for i, item := range activeList {
-						if i >= 8 {
-							break
-						}
+					curIdx := invCursor % len(activeList)
+					startIdx := 0
+					if curIdx >= 8 {
+						startIdx = curIdx - 7
+					}
+					for row := 0; row < 8 && startIdx+row < len(activeList); row++ {
+						i := startIdx + row
+						item := activeList[i]
 						prefix := "   "
 						col := rl.RayWhite
-						if i == invCursor%len(activeList) {
+						if i == curIdx {
 							prefix = "-> "
 							col = rl.Gold
 						}
@@ -4198,7 +4214,10 @@ func main() {
 							meta += fmt.Sprintf(" | %.2fx%.2fx%.2fm", item.Bounds[0], item.Bounds[1], item.Bounds[2])
 						}
 						rowTxt := fmt.Sprintf("%s%s (%s) [%s]%s%s", prefix, item.Name, item.Hash[:6], meta, item.StatusTag, equipped)
-						drawUIText(truncateToWidth(rowTxt, 15, mw-330), mx+24, my+int32(88+i*32), 15, col)
+						drawUIText(truncateToWidth(rowTxt, 15, mw-330), mx+24, my+int32(88+row*32), 15, col)
+					}
+					if len(activeList) > 8 {
+						drawUIText(fmt.Sprintf("Showing %d-%d of %d", startIdx+1, minInt(startIdx+8, len(activeList)), len(activeList)), mx+mw-465, my+52, 14, rl.Gray)
 					}
 				}
 				drawUIText("[Up/Dn] Select | [Enter] Equip | [U] Upload .glb | [O] Open Folder | [R] Send | [D] Del", mx+24, my+mh-34, 15, rl.Gray)

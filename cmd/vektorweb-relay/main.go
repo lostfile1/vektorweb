@@ -35,8 +35,8 @@ const (
 	MaxWireFrameBytes  = 512 * 1024
 	MaxVoiceFrameBytes = 32 * 1024
 	MaxAssetChunkChars = 128 * 1024
-	MaxCachedPropBytes     = 10 * 1024 * 1024
-	MaxTotalPropCacheBytes = 256 * 1024 * 1024
+	MaxCachedPropBytes     = 24 * 1024 * 1024
+	MaxTotalPropCacheBytes = 512 * 1024 * 1024
 	MaxPropsPerClient      = 32
 	MaxTotalProps      = 512
 	PingInterval       = 25 * time.Second
@@ -693,8 +693,8 @@ script_sha256 = ""
 
 [rules]
 placement_mode = "ephemeral"
-max_avatar_mb = 15
-max_item_mb = 5
+max_avatar_mb = 24
+max_item_mb = 20
 admins = []
 `, domain, port)
 		if err := os.WriteFile(tomlPath, []byte(starterToml), 0644); err != nil {
@@ -1765,9 +1765,9 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 				s.sendError(cc, "ERR_INVALID_PROP", "prop requires valid prop_id, 64-char sha256 hash, and 3D pos")
 				continue
 			}
-			if math.IsNaN(float64(msg.Yaw)) || math.IsInf(float64(msg.Yaw), 0) {
-				msg.Yaw = 0
-			}
+			msg.Yaw = sanitizeFiniteFloat(msg.Yaw)
+			msg.Pitch = sanitizeFiniteFloat(msg.Pitch)
+			msg.Roll = sanitizeFiniteFloat(msg.Roll)
 			if math.IsNaN(float64(msg.Scale)) || math.IsInf(float64(msg.Scale), 0) || msg.Scale <= 0 {
 				msg.Scale = 1.0
 			}
