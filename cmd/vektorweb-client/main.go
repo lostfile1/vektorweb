@@ -54,8 +54,9 @@ type WorldBakedProp struct {
 	Pos   []float32 `toml:"pos"`
 	Yaw   float32   `toml:"yaw"`
 	Pitch float32   `toml:"pitch"`
-	Roll  float32   `toml:"roll"`
-	Scale float32   `toml:"scale"`
+	Roll     float32   `toml:"roll"`
+	Scale    float32   `toml:"scale"`
+	AnimClip int       `toml:"anim_clip"`
 }
 
 type WorldManifest struct {
@@ -217,6 +218,7 @@ type WireMsg struct {
 	Channel      string    `json:"channel,omitempty"`
 	PropID       string    `json:"prop_id,omitempty"`
 	Scale        float32   `json:"scale,omitempty"`
+	AnimClip     int       `json:"anim_clip,omitempty"`
 	Code         string    `json:"code,omitempty"`
 	Message      string    `json:"message,omitempty"`
 }
@@ -267,8 +269,10 @@ type RemotePeer struct {
 	TargetPos  rl.Vector3
 	TargetYaw  float32
 	HasPos     bool
-	AvatarHash string
-	LastSeen   time.Time
+	AvatarHash  string
+	AnimClip    int
+	AvatarScale float32
+	LastSeen    time.Time
 	Speaking   time.Time
 }
 
@@ -279,8 +283,9 @@ type WorldProp struct {
 	Pos    rl.Vector3
 	Yaw    float32
 	Pitch  float32
-	Roll   float32
-	Scale  float32
+	Roll     float32
+	Scale    float32
+	AnimClip int
 }
 
 type InventoryItem struct {
@@ -338,6 +343,31 @@ type ModelAnimSet struct {
 	LastUpdate float64
 }
 
+func poseModelAnimClip(m rl.Model, animSet *ModelAnimSet, clipIdx int, phaseOffset int32) {
+	if animSet == nil || len(animSet.Anims) == 0 {
+		return
+	}
+	if clipIdx < 0 {
+		anim := animSet.Anims[0]
+		if anim.KeyframeCount > 0 {
+			rl.UpdateModelAnimation(m, anim, 0)
+		}
+		return
+	}
+	if clipIdx >= len(animSet.Anims) {
+		clipIdx = 0
+	}
+	anim := animSet.Anims[clipIdx]
+	if anim.KeyframeCount <= 0 {
+		return
+	}
+	frame := (animSet.Frame + phaseOffset) % anim.KeyframeCount
+	if frame < 0 {
+		frame += anim.KeyframeCount
+	}
+	rl.UpdateModelAnimation(m, anim, float32(frame))
+}
+
 func populateInventoryBounds(items []InventoryItem, models map[string]rl.Model) {
 	for i := range items {
 		if items[i].HasBounds {
@@ -359,15 +389,46 @@ func populateInventoryBounds(items []InventoryItem, models map[string]rl.Model) 
 	}
 }
 
-func modelFeetOffsetY(m rl.Model) float32 {
+type ModelMetrics struct {
+	FeetOffsetY float32
+	BaseScale   float32
+}
+
+func computeModelMetrics(m rl.Model) ModelMetrics {
+	met := ModelMetrics{BaseScale: 1.0}
 	if m.MeshCount <= 0 {
-		return 0
+		return met
 	}
 	bb := rl.GetModelBoundingBox(m)
-	if math.IsNaN(float64(bb.Min.Y)) || math.IsInf(float64(bb.Min.Y), 0) {
-		return 0
+	if !math.IsNaN(float64(bb.Min.Y)) && !math.IsInf(float64(bb.Min.Y), 0) {
+		met.FeetOffsetY = -bb.Min.Y
 	}
-	return -bb.Min.Y
+	extY := bb.Max.Y - bb.Min.Y
+	extX := bb.Max.X - bb.Min.X
+	extZ := bb.Max.Z - bb.Min.Z
+	if math.IsNaN(float64(extY)) || math.IsInf(float64(extY), 0) {
+		return met
+	}
+	refDim := extY
+	if extX > refDim*1.6 {
+		refDim = extX * 0.75
+	}
+	if extZ > refDim*1.6 {
+		refDim = extZ * 0.75
+	}
+	if refDim > 2.4 || (refDim > 0.001 && refDim < 0.45) {
+		met.BaseScale = 1.75 / refDim
+	}
+	return met
+}
+
+func getAvatarMetrics(metrics map[string]ModelMetrics, hash string, m rl.Model) ModelMetrics {
+	if met, ok := metrics[hash]; ok {
+		return met
+	}
+	met := computeModelMetrics(m)
+	metrics[hash] = met
+	return met
 }
 
 func drawModelEuler(m rl.Model, pos rl.Vector3, yawDeg, pitchDeg, rollDeg, scale float32, tint rl.Color) {
@@ -1761,8 +1822,9 @@ func main() {
 				Pos:    rl.NewVector3(bp.Pos[0], bp.Pos[1], bp.Pos[2]),
 				Yaw:    bp.Yaw,
 				Pitch:  bp.Pitch,
-				Roll:   bp.Roll,
-				Scale:  scale,
+				Roll:     bp.Roll,
+				Scale:    scale,
+				AnimClip: bp.AnimClip,
 			}
 			if ensureAssetQueued(netState, hLower) {
 				toFetch = append(toFetch, hLower)
@@ -1892,6 +1954,7 @@ func main() {
 
 	loadedModels := make(map[string]rl.Model)
 	loadedAnims := make(map[string]*ModelAnimSet)
+	modelMetrics := make(map[string]ModelMetrics)
 	for _, pe := range propInv {
 		m, a := loadModelWithAnims(filepath.Join(cacheDir, pe.Hash+".glb"), fogShader, cfg.EnableFog)
 		loadedModels[pe.Hash] = m
@@ -2157,6 +2220,9 @@ func main() {
 	ghostRollOffset := float32(0)
 	ghostYOffset := float32(0)
 	ghostScale := float32(1.0)
+	ghostAnimClip := 0
+	localManualClip := -1
+	localActiveClip := 0
 	showRangeRing := false
 	dirCursor := 0
 	dirConnectActive := false
@@ -2226,6 +2292,7 @@ func main() {
 			netState.localAssets[h] = b
 			netState.mu.Unlock()
 			localAvHash = h
+			localManualClip = -1
 			cfg.AvatarHash = h
 			saveClientSettings(settingsPath, cfg)
 			avatarInv = scanInventoryFolder(avatarsDir, "avatar", cacheDir, kp.PubHex(), maxAvMB*1024*1024, localAssets)
@@ -2390,32 +2457,41 @@ func main() {
 			dt = 0.1
 		}
 
-		// Step embedded glTF animations (~30 fps keyframe advance)
+		// Advance embedded glTF animation clocks (~30 fps) without redundant skinning passes
 		nowSec := rl.GetTime()
-		stepAnim := func(m rl.Model, animSet *ModelAnimSet) {
+		advanceAnimClock := func(animSet *ModelAnimSet) bool {
 			if animSet == nil || len(animSet.Anims) == 0 {
-				return
-			}
-			idx := animSet.ClipIdx
-			if idx < 0 || idx >= len(animSet.Anims) {
-				idx = 0
-				animSet.ClipIdx = 0
-			}
-			anim := animSet.Anims[idx]
-			if anim.KeyframeCount <= 0 {
-				return
+				return false
 			}
 			if nowSec-animSet.LastUpdate >= 1.0/30.0 {
 				animSet.LastUpdate = nowSec
-				animSet.Frame = (animSet.Frame + 1) % anim.KeyframeCount
-				rl.UpdateModelAnimation(m, anim, float32(animSet.Frame))
+				animSet.Frame = (animSet.Frame + 1) % 1000000
+				return true
 			}
+			return false
 		}
-		stepAnim(worldModel, worldAnims)
-		for h, animSet := range loadedAnims {
-			if m, ok := loadedModels[h]; ok {
-				stepAnim(m, animSet)
+		if advanceAnimClock(worldAnims) {
+			poseModelAnimClip(worldModel, worldAnims, worldAnims.ClipIdx, 0)
+		}
+		for _, animSet := range loadedAnims {
+			advanceAnimClock(animSet)
+		}
+		if animSet, ok := loadedAnims[localAvHash]; ok && len(animSet.Anims) > 0 {
+			if localManualClip >= 0 && localManualClip < len(animSet.Anims) {
+				localActiveClip = localManualClip
+			} else {
+				moving := rl.IsKeyDown(rl.KeyW) || rl.IsKeyDown(rl.KeyA) || rl.IsKeyDown(rl.KeyS) || rl.IsKeyDown(rl.KeyD)
+				if !moving || len(animSet.Anims) == 1 {
+					localActiveClip = 0
+				} else if rl.IsKeyDown(rl.KeyLeftShift) && len(animSet.Anims) >= 3 {
+					localActiveClip = 2
+				} else {
+					localActiveClip = 1
+				}
 			}
+			animSet.ClipIdx = localActiveClip
+		} else {
+			localActiveClip = 0
 		}
 
 		// Periodic stale assembly & peer cleanup
@@ -2706,7 +2782,18 @@ func main() {
 					} else if canDel {
 						ownerLabel = "You"
 					}
-					sub := "Owner: " + ownerLabel + "  |  [E] Interact"
+					animTag := ""
+					if animSet, hasAnim := loadedAnims[prop.Hash]; hasAnim && len(animSet.Anims) > 0 {
+						if prop.AnimClip < 0 {
+							animTag = fmt.Sprintf("  |  Anim: Paused/%d", len(animSet.Anims))
+						} else {
+							animTag = fmt.Sprintf("  |  Anim: %d/%d", (prop.AnimClip%len(animSet.Anims))+1, len(animSet.Anims))
+						}
+					}
+					sub := "Owner: " + ownerLabel + animTag + "  |  [E] Interact"
+					if animTag != "" {
+						sub = "Owner: " + ownerLabel + animTag + "  |  [E] Cycle Anim"
+					}
 					if canDel {
 						sub += "  |  [C] Clone  |  [Del] Remove"
 					}
@@ -3029,6 +3116,7 @@ func main() {
 						netState.localAvBytes = localAssets[chosen.Hash]
 						netState.mu.Unlock()
 						localAvHash = chosen.Hash
+						localManualClip = -1
 						cfg.AvatarHash = chosen.Hash
 						saveClientSettings(settingsPath, cfg)
 						netState.addChat("[AVATAR]: Equipped & saved " + chosen.Name)
@@ -3265,14 +3353,44 @@ func main() {
 								}
 								ghostPitchOffset = srcProp.Pitch
 								ghostRollOffset = srcProp.Roll
+								ghostAnimClip = srcProp.AnimClip
 								ghostActive = true
 								netState.addChat("[BUILD]: Cloned " + lookedAt.Label + " into Build Mode ([P] to place)")
 							}
 						} else if rl.IsKeyPressed(rl.KeyE) {
-							netState.mu.RLock()
+							netState.mu.Lock()
 							pr, ok := netState.props[lookedAt.ID]
-							netState.mu.RUnlock()
+							newClip := 0
+							cycledAnim := false
+							clipTotal := 0
 							if ok {
+								if animSet, hasAnim := loadedAnims[pr.Hash]; hasAnim && len(animSet.Anims) > 0 {
+									clipTotal = len(animSet.Anims)
+									if pr.AnimClip < 0 {
+										pr.AnimClip = 0
+									} else if pr.AnimClip+1 < clipTotal {
+										pr.AnimClip++
+									} else {
+										pr.AnimClip = -1
+									}
+									newClip = pr.AnimClip
+									cycledAnim = true
+								}
+							}
+							netState.mu.Unlock()
+							if ok {
+								if cycledAnim {
+									_ = netState.sendJSON(WireMsg{
+										Type:     "PROP_ANIM",
+										PropID:   pr.PropID,
+										AnimClip: newClip,
+									})
+									if newClip < 0 {
+										netState.addChat(fmt.Sprintf("[ANIM]: %s animation paused", lookedAt.Label))
+									} else {
+										netState.addChat(fmt.Sprintf("[ANIM]: %s clip %d/%d", lookedAt.Label, newClip+1, clipTotal))
+									}
+								}
 								if activeWorld.Sandbox != nil {
 									if hooks, hasHooks := any(activeWorld.Sandbox).(interface {
 										NotifyPropInteract(propID, hash, owner string)
@@ -3280,7 +3398,9 @@ func main() {
 										hooks.NotifyPropInteract(pr.PropID, pr.Hash, pr.Owner)
 									}
 								}
-								netState.addChat(fmt.Sprintf("[INTERACT]: Activated %s", lookedAt.Label))
+								if !cycledAnim {
+									netState.addChat(fmt.Sprintf("[INTERACT]: Activated %s", lookedAt.Label))
+								}
 							}
 						}
 					} else if lookedAt.Kind == "peer" && !ghostActive && rl.IsKeyPressed(rl.KeyE) {
@@ -3329,14 +3449,20 @@ func main() {
 				}
 				if rl.IsKeyPressed(rl.KeyN) && len(propInv) > 1 {
 					propIdx = (propIdx + 1) % len(propInv)
+					ghostAnimClip = 0
+				}
+				if rl.IsKeyPressed(rl.KeyZero) {
+					localManualClip = -1
+					netState.addChat("[ANIM]: Avatar auto-locomotion (Idle/Walk/Run) ON")
 				}
 				for clipKey := 0; clipKey < 9; clipKey++ {
 					if rl.IsKeyPressed(int32(rl.KeyOne + clipKey)) {
 						if animSet, ok := loadedAnims[localAvHash]; ok && len(animSet.Anims) > 0 {
 							if clipKey < len(animSet.Anims) {
+								localManualClip = clipKey
 								animSet.ClipIdx = clipKey
 								animSet.Frame = 0
-								netState.addChat(fmt.Sprintf("[ANIM]: Avatar clip %d/%d", clipKey+1, len(animSet.Anims)))
+								netState.addChat(fmt.Sprintf("[ANIM]: Pinned avatar clip %d/%d ([0] for Auto)", clipKey+1, len(animSet.Anims)))
 							} else {
 								netState.addChat(fmt.Sprintf("[ANIM]: Avatar only has %d animation clip(s)", len(animSet.Anims)))
 							}
@@ -3384,7 +3510,24 @@ func main() {
 						ghostRollOffset = 0
 						ghostYOffset = 0
 						ghostScale = 1.0
-						netState.addChat("[BUILD]: Reset prop rotation, tilt, height, and scale")
+						ghostAnimClip = 0
+						netState.addChat("[BUILD]: Reset prop rotation, tilt, height, scale, and anim")
+					}
+					if rl.IsKeyPressed(rl.KeyA) && activeProp.Hash != "" {
+						if animSet, ok := loadedAnims[activeProp.Hash]; ok && len(animSet.Anims) > 0 {
+							if ghostAnimClip < 0 {
+								ghostAnimClip = 0
+							} else if ghostAnimClip+1 < len(animSet.Anims) {
+								ghostAnimClip++
+							} else {
+								ghostAnimClip = -1
+							}
+							if ghostAnimClip < 0 {
+								netState.addChat("[BUILD]: Prop animation set to PAUSED")
+							} else {
+								netState.addChat(fmt.Sprintf("[BUILD]: Prop animation clip %d/%d", ghostAnimClip+1, len(animSet.Anims)))
+							}
+						}
 					}
 					if rl.IsKeyPressed(rl.KeyF4) {
 						spawn = safeSpawnPosition(worldModel, playerHeadPos)
@@ -3431,14 +3574,15 @@ func main() {
 					propID := hex.EncodeToString(idBytes)
 
 					wp := &WorldProp{
-						PropID: propID,
-						Owner:  kp.PubHex(),
-						Hash:   activeProp.Hash,
-						Pos:    ghostPos,
-						Yaw:    ghostYaw,
-						Pitch:  ghostPitchOffset,
-						Roll:   ghostRollOffset,
-						Scale:  ghostScale,
+						PropID:   propID,
+						Owner:    kp.PubHex(),
+						Hash:     activeProp.Hash,
+						Pos:      ghostPos,
+						Yaw:      ghostYaw,
+						Pitch:    ghostPitchOffset,
+						Roll:     ghostRollOffset,
+						Scale:    ghostScale,
+						AnimClip: ghostAnimClip,
 					}
 					netState.mu.Lock()
 					netState.props[propID] = wp
@@ -3446,14 +3590,15 @@ func main() {
 					ownedPropIDs = append(ownedPropIDs, propID)
 
 					_ = netState.sendJSON(WireMsg{
-						Type:   "PROP_SPAWN",
-						PropID: propID,
-						Hash:   activeProp.Hash,
-						Pos:    []float32{ghostPos.X, ghostPos.Y, ghostPos.Z},
-						Yaw:    ghostYaw,
-						Pitch:  ghostPitchOffset,
-						Roll:   ghostRollOffset,
-						Scale:  ghostScale,
+						Type:     "PROP_SPAWN",
+						PropID:   propID,
+						Hash:     activeProp.Hash,
+						Pos:      []float32{ghostPos.X, ghostPos.Y, ghostPos.Z},
+						Yaw:      ghostYaw,
+						Pitch:    ghostPitchOffset,
+						Roll:     ghostRollOffset,
+						Scale:    ghostScale,
+						AnimClip: ghostAnimClip,
 					})
 					netState.addChat(fmt.Sprintf("[PROP]: Placed %s (%s...)", activeProp.Name, propID[:6]))
 				}
@@ -3605,6 +3750,8 @@ func main() {
 				Pos:        []float32{bodyHeadPos.X, bodyHeadPos.Y, bodyHeadPos.Z},
 				Yaw:        bodyYaw,
 				AvatarHash: localAvHash,
+				AnimClip:   localActiveClip,
+				Scale:      cfg.AvatarScale,
 			})
 		}
 
@@ -3664,13 +3811,16 @@ func main() {
 
 		if thirdPerson && walkMode {
 			feetPos := rl.NewVector3(bodyHeadPos.X, bodyHeadPos.Y-1.65, bodyHeadPos.Z)
-			avSc := cfg.AvatarScale
-			if avSc <= 0 {
-				avSc = 1.0
+			userAvSc := cfg.AvatarScale
+			if userAvSc <= 0 {
+				userAvSc = 1.0
 			}
-			rl.DrawCircle3D(rl.NewVector3(feetPos.X, feetPos.Y+0.02, feetPos.Z), 0.42*avSc, rl.NewVector3(1, 0, 0), 90, rl.Fade(rl.SkyBlue, 0.7))
+			rl.DrawCircle3D(rl.NewVector3(feetPos.X, feetPos.Y+0.02, feetPos.Z), 0.42*userAvSc, rl.NewVector3(1, 0, 0), 90, rl.Fade(rl.SkyBlue, 0.7))
 			if mod, ok := loadedModels[localAvHash]; ok {
-				drawPos := rl.NewVector3(feetPos.X, feetPos.Y+modelFeetOffsetY(mod)*avSc, feetPos.Z)
+				met := getAvatarMetrics(modelMetrics, localAvHash, mod)
+				poseModelAnimClip(mod, loadedAnims[localAvHash], localActiveClip, 0)
+				avSc := met.BaseScale * userAvSc
+				drawPos := rl.NewVector3(feetPos.X, feetPos.Y+met.FeetOffsetY*avSc, feetPos.Z)
 				rl.DrawModelEx(mod, drawPos, rl.NewVector3(0, 1, 0), bodyYaw, rl.NewVector3(avSc, avSc, avSc), rl.White)
 			} else {
 				rl.DrawCapsule(
@@ -3687,6 +3837,7 @@ func main() {
 			rl.DrawCylinderWires(spawnFloor, 0.85, 0.85, 2.0, 12, rl.Fade(rl.Gold, 0.65))
 			if activeProp.Hash != "" {
 				if mod, ok := loadedModels[activeProp.Hash]; ok {
+					poseModelAnimClip(mod, loadedAnims[activeProp.Hash], ghostAnimClip, 0)
 					drawModelEuler(mod, ghostPos, ghostYaw, ghostPitchOffset, ghostRollOffset, ghostScale, rl.Fade(rl.Lime, 0.55))
 				}
 				rl.DrawCircle3D(ghostPos, 0.5, rl.NewVector3(1, 0, 0), 90, rl.Lime)
@@ -3708,6 +3859,7 @@ func main() {
 				if s <= 0 {
 					s = 1.0
 				}
+				poseModelAnimClip(mod, loadedAnims[prop.Hash], prop.AnimClip, int32(len(prop.PropID)*7))
 				drawModelEuler(mod, prop.Pos, prop.Yaw, prop.Pitch, prop.Roll, s, rl.White)
 			} else {
 				rl.DrawCubeWires(prop.Pos, 0.8, 0.8, 0.8, rl.Gold)
@@ -3735,8 +3887,15 @@ func main() {
 			}
 			peerFeetPos := rl.NewVector3(peer.Pos.X, peer.Pos.Y-1.65, peer.Pos.Z)
 			if mod, ok := loadedModels[peer.AvatarHash]; ok {
-				drawPos := rl.NewVector3(peerFeetPos.X, peerFeetPos.Y+modelFeetOffsetY(mod), peerFeetPos.Z)
-				rl.DrawModelEx(mod, drawPos, rl.NewVector3(0, 1, 0), peer.Yaw, rl.NewVector3(1, 1, 1), rl.White)
+				met := getAvatarMetrics(modelMetrics, peer.AvatarHash, mod)
+				poseModelAnimClip(mod, loadedAnims[peer.AvatarHash], peer.AnimClip, int32(len(peer.Nick)*11))
+				uSc := peer.AvatarScale
+				if uSc < 0.25 || uSc > 4.0 {
+					uSc = 1.0
+				}
+				peerSc := met.BaseScale * uSc
+				drawPos := rl.NewVector3(peerFeetPos.X, peerFeetPos.Y+met.FeetOffsetY*peerSc, peerFeetPos.Z)
+				rl.DrawModelEx(mod, drawPos, rl.NewVector3(0, 1, 0), peer.Yaw, rl.NewVector3(peerSc, peerSc, peerSc), rl.White)
 			} else {
 				rl.DrawCapsule(
 					rl.NewVector3(peerFeetPos.X, peerFeetPos.Y+0.35, peerFeetPos.Z),
@@ -4122,6 +4281,9 @@ func main() {
 						Fovy:       45.0,
 						Projection: rl.CameraPerspective,
 					}
+					if animSet, hasAnim := loadedAnims[selItem.Hash]; hasAnim && len(animSet.Anims) > 0 {
+						poseModelAnimClip(mod, animSet, 0, 0)
+					}
 					if cfg.EnableFog {
 						setModelFog(mod, false)
 					}
@@ -4144,7 +4306,11 @@ func main() {
 				if selItem.HasBounds {
 					drawUIText(fmt.Sprintf("Size: %.2f x %.2f x %.2fm", selItem.Bounds[0], selItem.Bounds[1], selItem.Bounds[2]), px, py+ph+26, 13, rl.LightGray)
 				}
-				drawUIText("SHA: "+selItem.Hash[:16]+"...", px, py+ph+44, 13, rl.Gray)
+				shaLine := "SHA: " + selItem.Hash[:12] + "..."
+				if animSet, hasAnim := loadedAnims[selItem.Hash]; hasAnim && len(animSet.Anims) > 0 {
+					shaLine += fmt.Sprintf(" | Clips: %d", len(animSet.Anims))
+				}
+				drawUIText(shaLine, px, py+ph+44, 13, rl.Gray)
 			}
 
 			if transferModalOpen && len(activeList) > 0 {
@@ -4978,26 +5144,28 @@ func handleChatCommand(
 	if input == "/exportworld" {
 		ns.mu.RLock()
 		type snapProp struct {
-			id    string
-			hash  string
-			owner string
-			pos   rl.Vector3
-			yaw   float32
-			pitch float32
-			roll  float32
-			scale float32
+			id       string
+			hash     string
+			owner    string
+			pos      rl.Vector3
+			yaw      float32
+			pitch    float32
+			roll     float32
+			scale    float32
+			animClip int
 		}
 		var list []snapProp
 		for _, pr := range ns.props {
 			list = append(list, snapProp{
-				id:    pr.PropID,
-				hash:  pr.Hash,
-				owner: pr.Owner,
-				pos:   pr.Pos,
-				yaw:   pr.Yaw,
-				pitch: pr.Pitch,
-				roll:  pr.Roll,
-				scale: pr.Scale,
+				id:       pr.PropID,
+				hash:     pr.Hash,
+				owner:    pr.Owner,
+				pos:      pr.Pos,
+				yaw:      pr.Yaw,
+				pitch:    pr.Pitch,
+				roll:     pr.Roll,
+				scale:    pr.Scale,
+				animClip: pr.AnimClip,
 			})
 		}
 		ns.mu.RUnlock()
@@ -5023,7 +5191,11 @@ func handleChatCommand(
 				fmt.Fprintf(&sb, "pitch = %.2f\n", sp.pitch)
 				fmt.Fprintf(&sb, "roll = %.2f\n", sp.roll)
 			}
-			fmt.Fprintf(&sb, "scale = %.2f\n\n", s)
+			fmt.Fprintf(&sb, "scale = %.2f\n", s)
+			if sp.animClip != 0 {
+				fmt.Fprintf(&sb, "anim_clip = %d\n", sp.animClip)
+			}
+			fmt.Fprintf(&sb, "\n")
 		}
 
 		fname := fmt.Sprintf("world_snapshot_%s.toml", time.Now().Format("20060102_150405"))
@@ -5468,6 +5640,12 @@ func runRelaySession(ctx context.Context, conn *websocket.Conn, relayHost string
 			p.TargetYaw = msg.Yaw
 			p.HasPos = true
 			p.AvatarHash = msg.AvatarHash
+			p.AnimClip = msg.AnimClip
+			if msg.Scale >= 0.25 && msg.Scale <= 4.0 {
+				p.AvatarScale = msg.Scale
+			} else if p.AvatarScale <= 0 {
+				p.AvatarScale = 1.0
+			}
 			p.LastSeen = time.Now()
 
 			needAsset := ensureAssetQueued(ns, msg.AvatarHash)
@@ -5503,14 +5681,15 @@ func runRelaySession(ctx context.Context, conn *websocket.Conn, relayHost string
 				continue
 			}
 			ns.props[msg.PropID] = &WorldProp{
-				PropID: msg.PropID,
-				Owner:  msg.PubKey,
-				Hash:   msg.Hash,
-				Pos:    rl.NewVector3(msg.Pos[0], msg.Pos[1], msg.Pos[2]),
-				Yaw:    msg.Yaw,
-				Pitch:  msg.Pitch,
-				Roll:   msg.Roll,
-				Scale:  scale,
+				PropID:   msg.PropID,
+				Owner:    msg.PubKey,
+				Hash:     msg.Hash,
+				Pos:      rl.NewVector3(msg.Pos[0], msg.Pos[1], msg.Pos[2]),
+				Yaw:      msg.Yaw,
+				Pitch:    msg.Pitch,
+				Roll:     msg.Roll,
+				Scale:    scale,
+				AnimClip: msg.AnimClip,
 			}
 			needAsset := ensureAssetQueued(ns, msg.Hash)
 			ns.mu.Unlock()
@@ -5525,6 +5704,13 @@ func runRelaySession(ctx context.Context, conn *websocket.Conn, relayHost string
 					_ = ns.sendJSON(WireMsg{Type: "REQ_ASSET", Hash: msg.Hash})
 				}
 			}
+
+		case "PROP_ANIM":
+			ns.mu.Lock()
+			if pr, ok := ns.props[msg.PropID]; ok {
+				pr.AnimClip = msg.AnimClip
+			}
+			ns.mu.Unlock()
 
 		case "PROP_REMOVE":
 			ns.mu.Lock()

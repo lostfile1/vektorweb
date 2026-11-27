@@ -68,6 +68,7 @@ type WireMsg struct {
 	Channel      string    `json:"channel,omitempty"`
 	PropID       string    `json:"prop_id,omitempty"`
 	Scale        float32   `json:"scale,omitempty"`
+	AnimClip     int       `json:"anim_clip,omitempty"`
 	Code         string    `json:"code,omitempty"`
 	Message      string    `json:"message,omitempty"`
 }
@@ -79,8 +80,9 @@ type WorldBakedProp struct {
 	Pos   []float32 `toml:"pos"`
 	Yaw   float32   `toml:"yaw"`
 	Pitch float32   `toml:"pitch"`
-	Roll  float32   `toml:"roll"`
-	Scale float32   `toml:"scale"`
+	Roll     float32   `toml:"roll"`
+	Scale    float32   `toml:"scale"`
+	AnimClip int       `toml:"anim_clip"`
 }
 
 type WorldConfigTOML struct {
@@ -125,6 +127,8 @@ type ClientConn struct {
 	pubKey       string
 	nick         string
 	avatarHash   string
+	animClip     int
+	avatarScale  float32
 	capabilities []string
 	pos          [3]float32
 	yaw          float32
@@ -596,8 +600,9 @@ func (s *RelayServer) reloadConfigFiles(force bool) {
 						Pos:    []float32{bp.Pos[0], bp.Pos[1], bp.Pos[2]},
 						Yaw:    yaw,
 						Pitch:  pitch,
-						Roll:   roll,
-						Scale:  scale,
+						Roll:     roll,
+						Scale:    scale,
+						AnimClip: bp.AnimClip,
 					}
 				}
 				for id := range s.props {
@@ -1561,6 +1566,8 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 			PubKey:     peer.pubKey,
 			Nick:       peer.nick,
 			AvatarHash: peer.avatarHash,
+			AnimClip:   peer.animClip,
+			Scale:      peer.avatarScale,
 			Pos:        []float32{peer.pos[0], peer.pos[1], peer.pos[2]},
 			Yaw:        peer.yaw,
 		})
@@ -1698,6 +1705,14 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 			if msg.AvatarHash != "" {
 				cc.avatarHash = msg.AvatarHash
 			}
+			if msg.AnimClip < -1 || msg.AnimClip > 64 {
+				msg.AnimClip = 0
+			}
+			cc.animClip = msg.AnimClip
+			if math.IsNaN(float64(msg.Scale)) || math.IsInf(float64(msg.Scale), 0) || msg.Scale < 0.25 || msg.Scale > 4.0 {
+				msg.Scale = 1.0
+			}
+			cc.avatarScale = msg.Scale
 			msg.Nick = cc.nick
 			s.mu.Unlock()
 
@@ -1774,6 +1789,9 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 			if msg.Scale > 25.0 {
 				msg.Scale = 25.0
 			}
+			if msg.AnimClip < -1 || msg.AnimClip > 64 {
+				msg.AnimClip = 0
+			}
 
 			s.mu.Lock()
 			hLower := strings.ToLower(msg.Hash)
@@ -1812,6 +1830,26 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 
 			s.requestPropCacheFromClient(cc, auth.PubKey, msg.Hash)
 			s.broadcast(auth.PubKey, msg, false)
+
+		case "PROP_ANIM":
+			if msg.PropID == "" || msg.AnimClip < -1 || msg.AnimClip > 64 {
+				continue
+			}
+			s.mu.Lock()
+			if pr, ok := s.props[msg.PropID]; ok {
+				pr.AnimClip = msg.AnimClip
+				s.props[msg.PropID] = pr
+				s.savePersistentPropsLocked()
+				s.mu.Unlock()
+				s.broadcast(auth.PubKey, WireMsg{
+					Type:     "PROP_ANIM",
+					PubKey:   auth.PubKey,
+					PropID:   msg.PropID,
+					AnimClip: msg.AnimClip,
+				}, false)
+			} else {
+				s.mu.Unlock()
+			}
 
 		case "PROP_REMOVE":
 			if msg.PropID == "" {
