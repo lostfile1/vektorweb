@@ -38,6 +38,19 @@ chmod +x build.sh
 
 On first launch, `vektorweb-relay` automatically initializes `./world/` with a starter `world.toml`, `environment.glb`, `world.lua`, `bans.txt`, and `blocked_items.txt`.
 
+#### Relay CLI Flags
+
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `-addr` | `0.0.0.0:7777` | Listen address (`host:port`) |
+| `-domain` | *(auto)* | Public domain or IP bound to Ed25519 challenges |
+| `-dir` | `./world` | World directory containing `world.toml`, `environment.glb`, and `world.lua` |
+| `-http` | `true` | Serve world files, `/status.json`, and `/directory.json` over HTTP |
+| `-placement` | `ephemeral` | Prop placement policy: `forbid` \| `ephemeral` \| `admin_only` \| `persistent` |
+| `-trust-proxy` | `false` | Trust `X-Real-IP` / `X-Forwarded-For` from Nginx or Caddy |
+| `-announce` | `""` | Optional federated directory URL to POST live status pings every 60s |
+| `-admin` | `""` | Comma-separated 64-char hex Ed25519 admin public keys |
+
 ### 3. Launch the Client
 
 ```bash
@@ -49,7 +62,34 @@ Live demo node: `vektorweb://vektor.whitenode45.ddns.net/world.toml`
 
 ---
 
-## Controls & Shortcuts
+## Relay Operator Console
+
+When `vektorweb-relay` is started in an interactive terminal (TTY), it provides a built-in operator console on standard input (`stdin`). When running detached in the background (such as under `systemd`, `rc.d`, or `nohup`), the console automatically disables itself so it will not consume CPU or exit on EOF.
+
+### Console Commands
+
+| Command | Description |
+| :--- | :--- |
+| `help` | Print available operator console commands |
+| `status` | Display world title, online player count, active prop count, placement mode, and uptime |
+| `reload` | Immediately reload `world.toml`, `bans.txt`, and `blocked_items.txt` from disk (also triggered by `kill -USR1 <pid>`) |
+| `say <message>` | Broadcast a server-wide announcement to all connected players as `[SERVER]` |
+| `kick <nick\|pubkey>` | Disconnect an online player by nickname or Ed25519 public key prefix |
+| `ban <nick\|pubkey>` | Disconnect an online player (or ban an offline 64-char hex pubkey) and append their key to `bans.txt` |
+| `clearprops` | Remove all placed props from the world and broadcast `PROP_REMOVE` to all clients |
+
+### In-Game Admin Commands
+
+Operators whose 64-char Ed25519 public key is listed in `-admin` or `world.toml` (`rules.admins`) can also run moderation commands directly from the client chat bar (`/`):
+
+- `/setspawn` or `/setspawn <x> <y> <z>` — Update and save the world's spawn coordinates in `world.toml`
+- `/kick <nick|pubkey>` — Kick a player from the relay
+- `/ban <nick|pubkey>` — Ban a player and persist their key to `bans.txt`
+- `/clearprops` — Clear all placed props in the world
+
+---
+
+## Client Controls & Shortcuts
 
 | Key / Input | Action |
 | :--- | :--- |
@@ -61,9 +101,9 @@ Live demo node: `vektorweb://vektor.whitenode45.ddns.net/world.toml`
 | `[Q/E]` `[Z/X]` `[PgUp/Dn]` | Rotate Yaw / Tilt Pitch & Roll / Adjust Height (`[+/-]` Scale, `[P]` Place) |
 | Look-At Target | `[E]` Interact with prop / Offer trade to peer, `[C]` Clone own prop, `[Del]` Remove |
 | `[V]` / `[M]` / `[U]` | Hold Push-to-Talk (`35m`) / Mute incoming voice / Mute world radio stream |
-| `[Tab]` / `[F12]` | Open World Directory / Save screenshot to `exports/` |
+| `[Tab]` | Open World Directory (`[N]` Connect to new URL, `[F]` Pin #1, `[Del]` Remove, `[R]` Refresh) |
 | `[T]` or `[/]` | Open Chat (`/help`, `/uploadavatar`, `/outfit`, `/exportworld`, `/clearmyprops`, `/nick`, `/bookmark`) |
-| `[F1]` / `[F2]` / `[F3]` | Full Controls Help / Client Settings / Online Peers List |
+| `[F1]` / `[F2]` / `[F3]` / `[F12]` | Controls Help / Client Settings / Online Peers List / Save Screenshot to `exports/` |
 
 ---
 
