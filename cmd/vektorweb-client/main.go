@@ -1539,7 +1539,12 @@ func main() {
 	_ = os.MkdirAll(exportsDir, 0755)
 
 	settingsPath := filepath.Join(baseDir, "settings.toml")
+	_, settingsStatErr := os.Stat(settingsPath)
+	isFirstRun := os.IsNotExist(settingsStatErr)
 	cfg := loadClientSettings(settingsPath)
+	if isFirstRun {
+		saveClientSettings(settingsPath, cfg)
+	}
 
 	if !worldExplicit {
 		if savedW := strings.TrimSpace(cfg.LastWorld); savedW != "" && normalizeWorldURL(savedW) != "local://sandbox" {
@@ -2142,6 +2147,9 @@ func main() {
 	ghostScale := float32(1.0)
 	showRangeRing := false
 	dirCursor := 0
+	dirConnectActive := false
+	dirConnectInput := ""
+	welcomeOpen := isFirstRun
 
 	chatInput := ""
 	var chatHistory []string
@@ -2336,7 +2344,7 @@ func main() {
 			propInv = scanInventoryFolder(itemsDir, "prop", cacheDir, kp.PubHex(), maxItemMB*1024*1024, localAssets)
 		}
 
-		anyOverlay := chatActive || invOpen || dirOpen || settingsOpen || peersOpen || helpOpen || hasIncomingOffer || pendingDrop != nil
+		anyOverlay := chatActive || invOpen || dirOpen || settingsOpen || peersOpen || helpOpen || welcomeOpen || hasIncomingOffer || pendingDrop != nil
 
 		if !rl.IsWindowFocused() {
 			rl.SetTargetFPS(15)
@@ -2635,7 +2643,9 @@ func main() {
 			}
 			if rl.IsKeyPressed(rl.KeyTab) {
 				dirOpen = !dirOpen
-				invOpen, transferModalOpen, helpOpen, settingsOpen, peersOpen = false, false, false, false, false
+				dirConnectActive = false
+				dirConnectInput = ""
+				invOpen, transferModalOpen, helpOpen, settingsOpen, peersOpen, welcomeOpen = false, false, false, false, false, false
 				if dirOpen {
 					dirCursor = 0
 					refreshPortalStatuses(directory)
@@ -2729,6 +2739,10 @@ func main() {
 		}
 
 		if pendingDrop != nil || hasIncomingOffer {
+		} else if welcomeOpen {
+			if rl.IsKeyPressed(rl.KeyEscape) || rl.IsKeyPressed(rl.KeyEnter) || rl.IsKeyPressed(rl.KeySpace) {
+				welcomeOpen = false
+			}
 		} else if helpOpen {
 			if rl.IsKeyPressed(rl.KeyEscape) {
 				helpOpen = false
@@ -3024,57 +3038,126 @@ func main() {
 				}
 			}
 		} else if dirOpen {
-			dirStatusMu.Lock()
-			visDirCount := len(directory.Worlds)
-			if visDirCount > 8 {
-				visDirCount = 8
-			}
-			var hopTarget string
-			if rl.IsKeyPressed(rl.KeyDown) || rl.IsKeyPressed(rl.KeyS) {
-				if visDirCount > 0 {
-					dirCursor = (dirCursor + 1) % visDirCount
-				}
-			}
-			if rl.IsKeyPressed(rl.KeyUp) || rl.IsKeyPressed(rl.KeyW) {
-				if visDirCount > 0 {
-					dirCursor = (dirCursor - 1 + visDirCount) % visDirCount
-				}
-			}
-			if rl.IsKeyPressed(rl.KeyEnter) && visDirCount > 0 {
-				idx := dirCursor % visDirCount
-				hopTarget = directory.Worlds[idx].URL
-				dirOpen = false
-			}
-			if rl.IsKeyPressed(rl.KeyF) && visDirCount > 0 {
-				idx := dirCursor % visDirCount
-				if idx > 0 {
-					pinned := directory.Worlds[idx]
-					copy(directory.Worlds[1:idx+1], directory.Worlds[0:idx])
-					directory.Worlds[0] = pinned
-					dirCursor = 0
-					if err := saveWorldDirectory(dirPath, directory); err == nil {
-						netState.addChat(fmt.Sprintf("[DIRECTORY]: Pinned %q to slot [1]", pinned.Name))
+			if dirConnectActive {
+				if (rl.IsKeyDown(rl.KeyLeftControl) || rl.IsKeyDown(rl.KeyRightControl)) && rl.IsKeyPressed(rl.KeyV) {
+					clip := sanitizeDisplayText(getClipboardSafe(), 200)
+					if clip != "" {
+						dirConnectInput += clip
+						if len(dirConnectInput) > 200 {
+							dirConnectInput = dirConnectInput[:200]
+						}
 					}
-				} else {
-					netState.addChat(fmt.Sprintf("[DIRECTORY]: %q is already pinned at slot [1]", directory.Worlds[0].Name))
 				}
-			}
-			for i := 0; i < visDirCount; i++ {
-				if rl.IsKeyPressed(int32(rl.KeyOne + i)) {
-					hopTarget = directory.Worlds[i].URL
+				for key := rl.GetCharPressed(); key > 0; key = rl.GetCharPressed() {
+					if key >= 32 && key <= 126 && len(dirConnectInput) < 200 {
+						dirConnectInput += string(rune(key))
+					}
+				}
+				if (rl.IsKeyPressed(rl.KeyBackspace) || rl.IsKeyPressedRepeat(rl.KeyBackspace)) && len(dirConnectInput) > 0 {
+					runes := []rune(dirConnectInput)
+					dirConnectInput = string(runes[:len(runes)-1])
+				}
+				if rl.IsKeyPressed(rl.KeyEnter) {
+					rawEntry := strings.TrimSpace(dirConnectInput)
+					dirConnectActive = false
+					dirConnectInput = ""
+					if rawEntry != "" {
+						if !strings.Contains(rawEntry, "://") {
+							rawEntry = "vektorweb://" + rawEntry
+						}
+						if !strings.HasSuffix(strings.ToLower(rawEntry), ".toml") && !strings.HasPrefix(rawEntry, "local://") {
+							rawEntry = strings.TrimRight(rawEntry, "/") + "/world.toml"
+						}
+						dirStatusMu.Lock()
+						exists := false
+						for _, ew := range directory.Worlds {
+							if normalizeWorldURL(ew.URL) == normalizeWorldURL(rawEntry) {
+								exists = true
+								break
+							}
+						}
+						if !exists {
+							directory.Worlds = append(directory.Worlds, struct {
+								Name string `toml:"name"`
+								URL  string `toml:"url"`
+							}{Name: rawEntry, URL: rawEntry})
+							_ = saveWorldDirectory(dirPath, directory)
+						}
+						dirStatusMu.Unlock()
+						dirOpen = false
+						hopToWorld(rawEntry, true)
+					}
+				} else if rl.IsKeyPressed(rl.KeyEscape) {
+					dirConnectActive = false
+					dirConnectInput = ""
+				}
+			} else {
+				dirStatusMu.Lock()
+				visDirCount := len(directory.Worlds)
+				if visDirCount > 8 {
+					visDirCount = 8
+				}
+				var hopTarget string
+				if rl.IsKeyPressed(rl.KeyN) {
+					dirConnectActive = true
+					dirConnectInput = ""
+				}
+				if rl.IsKeyPressed(rl.KeyDown) || rl.IsKeyPressed(rl.KeyS) {
+					if visDirCount > 0 {
+						dirCursor = (dirCursor + 1) % visDirCount
+					}
+				}
+				if rl.IsKeyPressed(rl.KeyUp) || rl.IsKeyPressed(rl.KeyW) {
+					if visDirCount > 0 {
+						dirCursor = (dirCursor - 1 + visDirCount) % visDirCount
+					}
+				}
+				if rl.IsKeyPressed(rl.KeyEnter) && visDirCount > 0 {
+					idx := dirCursor % visDirCount
+					hopTarget = directory.Worlds[idx].URL
 					dirOpen = false
-					break
 				}
-			}
-			dirStatusMu.Unlock()
-			if hopTarget != "" {
-				hopToWorld(hopTarget, true)
-			}
-			if rl.IsKeyPressed(rl.KeyR) {
-				refreshPortalStatuses(directory)
-			}
-			if rl.IsKeyPressed(rl.KeyEscape) {
-				dirOpen = false
+				if rl.IsKeyPressed(rl.KeyDelete) && len(directory.Worlds) > 1 && visDirCount > 0 {
+					idx := dirCursor % visDirCount
+					removed := directory.Worlds[idx].Name
+					directory.Worlds = append(directory.Worlds[:idx], directory.Worlds[idx+1:]...)
+					if dirCursor >= len(directory.Worlds) && dirCursor > 0 {
+						dirCursor--
+					}
+					_ = saveWorldDirectory(dirPath, directory)
+					netState.addChat(fmt.Sprintf("[DIRECTORY]: Removed %q from worlds.toml", removed))
+				}
+				if rl.IsKeyPressed(rl.KeyF) && visDirCount > 0 {
+					idx := dirCursor % visDirCount
+					if idx > 0 {
+						pinned := directory.Worlds[idx]
+						copy(directory.Worlds[1:idx+1], directory.Worlds[0:idx])
+						directory.Worlds[0] = pinned
+						dirCursor = 0
+						if err := saveWorldDirectory(dirPath, directory); err == nil {
+							netState.addChat(fmt.Sprintf("[DIRECTORY]: Pinned %q to slot [1]", pinned.Name))
+						}
+					} else {
+						netState.addChat(fmt.Sprintf("[DIRECTORY]: %q is already pinned at slot [1]", directory.Worlds[0].Name))
+					}
+				}
+				for i := 0; i < visDirCount; i++ {
+					if rl.IsKeyPressed(int32(rl.KeyOne + i)) {
+						hopTarget = directory.Worlds[i].URL
+						dirOpen = false
+						break
+					}
+				}
+				dirStatusMu.Unlock()
+				if hopTarget != "" {
+					hopToWorld(hopTarget, true)
+				}
+				if rl.IsKeyPressed(rl.KeyR) {
+					refreshPortalStatuses(directory)
+				}
+				if rl.IsKeyPressed(rl.KeyEscape) {
+					dirOpen = false
+				}
 			}
 		} else if !chatActive {
 			if rl.IsKeyPressed(rl.KeyT) {
@@ -4288,7 +4371,30 @@ func main() {
 			}
 			dirStatusMu.RUnlock()
 
-			drawUIText("[1-8 / Enter] Hop  |  [F] Pin to #1  |  [R] Refresh  |  [Tab / Esc] Close", mx+24, my+mh-34, 15, rl.Gold)
+			if dirConnectActive {
+				inBox := rl.NewRectangle(float32(mx+20), float32(my+mh-74), float32(mw-40), 32)
+				rl.DrawRectangleRounded(inBox, 0.2, 6, rl.NewColor(16, 24, 38, 250))
+				rl.DrawRectangleRoundedLinesEx(inBox, 0.2, 6, 1.3, rl.Lime)
+				drawUIText(fitInputTail("URL: ", dirConnectInput, "_", 16, mw-56), mx+28, my+mh-67, 16, rl.Lime)
+				drawUIText("[Enter] Connect & Save  |  [Ctrl+V] Paste  |  [Esc] Cancel", mx+24, my+mh-34, 15, rl.Gold)
+			} else {
+				drawUIText("[1-8/Enter] Hop | [N] Connect URL | [F] Pin #1 | [Del] Remove | [R] Refresh", mx+24, my+mh-34, 15, rl.Gold)
+			}
+		}
+
+		if welcomeOpen {
+			drawModalBackdrop(sw, sh)
+			mw, mh := int32(660), int32(330)
+			mx, my := (sw-mw)/2, (sh-mh)/2
+			drawGlassPanel(mx, my, mw, mh, rl.Lime, 248)
+			drawUITextShadow("WELCOME TO VEKTORWEB", mx+26, my+20, 21, rl.Lime)
+			drawUIText("Your local Ed25519 identity & starter avatars are ready.", mx+26, my+52, 16, rl.RayWhite)
+			drawUIText("• [Tab]      Browse live worlds or press [N] to connect to any server URL", mx+26, my+92, 16, rl.SkyBlue)
+			drawUIText("• [I]        Switch starter avatars, upload your own .glb ([U]), or arm props", mx+26, my+122, 16, rl.SkyBlue)
+			drawUIText("• [G] + [P]  Enter Build Mode and place props ([Q/E/Z/X] rotate & tilt)", mx+26, my+152, 16, rl.SkyBlue)
+			drawUIText("• [V] / [T]  Hold [V] for 35m proximity voice or press [T] for chat", mx+26, my+182, 16, rl.SkyBlue)
+			drawUIText("• [F1]       View full controls & slash commands anytime", mx+26, my+212, 16, rl.SkyBlue)
+			drawUIText("Press [Space], [Enter], or [Esc] to enter the world", mx+26, my+mh-38, 16, rl.Gold)
 		}
 
 		if helpOpen {

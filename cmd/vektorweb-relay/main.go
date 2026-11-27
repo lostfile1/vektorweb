@@ -332,6 +332,7 @@ func main() {
 	}
 
 	go srv.watchLoop()
+	go srv.stdinAdminLoop()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.handleRoot)
@@ -393,6 +394,97 @@ func main() {
 	_ = httpSrv.Close()
 	log.Printf("Shutdown complete.")
 	os.Exit(0)
+}
+
+func (s *RelayServer) stdinAdminLoop() {
+	stat, err := os.Stdin.Stat()
+	if err != nil || (stat.Mode()&os.ModeCharDevice) == 0 {
+		// Skip stdin loop when running detached under systemd / nohup without a TTY
+		return
+	}
+	sc := bufio.NewScanner(os.Stdin)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		switch {
+		case line == "help":
+			log.Printf("Console commands: status | reload | say <msg> | kick <nick|pubkey> | ban <nick|pubkey> | clearprops")
+		case line == "status":
+			s.mu.RLock()
+			log.Printf("Status: title=%q peers=%d props=%d placement=%s uptime=%ds",
+				s.worldTitle, len(s.clients), len(s.props), s.placementMode, int64(time.Since(s.startedAt).Seconds()))
+			s.mu.RUnlock()
+		case line == "reload":
+			s.reloadConfigFiles(true)
+			log.Printf("Reloaded bans.txt, blocked_items.txt, and world.toml")
+		case strings.HasPrefix(line, "say "):
+			msg := sanitizeControlChars(strings.TrimPrefix(line, "say "), 240)
+			if msg != "" {
+				s.broadcast("", WireMsg{
+					Type:      "CHAT",
+					Nick:      "SERVER",
+					Channel:   "global",
+					Text:      msg,
+					Timestamp: time.Now().Unix(),
+				}, false)
+				log.Printf("[SERVER]: %s", msg)
+			}
+		case line == "clearprops":
+			s.mu.Lock()
+			ids := make([]string, 0, len(s.props))
+			for id := range s.props {
+				ids = append(ids, id)
+			}
+			s.props = make(map[string]WireMsg)
+			s.savePersistentPropsLocked()
+			s.gcUnusedCachedPropsLocked()
+			s.mu.Unlock()
+			for _, id := range ids {
+				s.broadcast("", WireMsg{Type: "PROP_REMOVE", PropID: id}, false)
+			}
+			log.Printf("Cleared %d props from world", len(ids))
+		case strings.HasPrefix(line, "kick ") || strings.HasPrefix(line, "ban "):
+			isBan := strings.HasPrefix(line, "ban ")
+			q := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(line, "ban "), "kick "))
+			qLower := strings.ToLower(q)
+			s.mu.Lock()
+			var target *ClientConn
+			for pub, peer := range s.clients {
+				if strings.HasPrefix(strings.ToLower(pub), qLower) || strings.EqualFold(peer.nick, q) {
+					target = peer
+					break
+				}
+			}
+			if isBan && target != nil {
+				s.appendBanKeyLocked(target.pubKey)
+			} else if isBan && isValidHex64(qLower) {
+				s.appendBanKeyLocked(qLower)
+			}
+			s.mu.Unlock()
+			if target != nil {
+				code := "ERR_KICKED"
+				act := "kicked"
+				if isBan {
+					code = "ERR_BANNED"
+					act = "banned"
+				}
+				s.sendError(target, code, "you were "+act+" by server console")
+				go func(t *ClientConn) {
+					time.Sleep(50 * time.Millisecond)
+					t.close()
+				}(target)
+				log.Printf("Console %s %s (%s...)", act, target.nick, target.pubKey[:12])
+			} else if isBan && isValidHex64(qLower) {
+				log.Printf("Added offline pubkey %s... to bans.txt", qLower[:12])
+			} else {
+				log.Printf("No matching online peer for %q", q)
+			}
+		default:
+			log.Printf("Unknown console command %q (type 'help')", line)
+		}
+	}
 }
 
 func (s *RelayServer) watchLoop() {
