@@ -1194,10 +1194,19 @@ func licensePathForGLB(glbPath string) string {
 	return glbPath + ".license.json"
 }
 
+var verboseLog bool
+
+func vlogf(format string, args ...any) {
+	if verboseLog {
+		log.Printf("[VERBOSE] "+format, args...)
+	}
+}
+
 func scanInventoryFolder(folder, kind, cacheDir, localPubKey string, maxBytes int, localAssets map[string][]byte) []InventoryItem {
 	var out []InventoryItem
 	entries, err := os.ReadDir(folder)
 	if err != nil {
+		log.Printf("Inventory scan failed on %s: %v", folder, err)
 		return out
 	}
 	for _, e := range entries {
@@ -1207,9 +1216,11 @@ func scanInventoryFolder(folder, kind, cacheDir, localPubKey string, maxBytes in
 		fullPath := filepath.Join(folder, e.Name())
 		b, err := os.ReadFile(fullPath)
 		if err != nil {
+			log.Printf("Skipping %s (%s): read error: %v", e.Name(), kind, err)
 			continue
 		}
 		if err := glbguard.ValidateGLB(b, maxBytes); err != nil {
+			log.Printf("Skipping %s (%s, %s): rejected by glbguard/size limit (%v)", e.Name(), kind, formatByteSize(int64(len(b))), err)
 			continue
 		}
 		h := identity.FileSHA256(b)
@@ -1542,16 +1553,22 @@ func loadModelWithAnims(glbPath string, sh rl.Shader, useFog bool) (rl.Model, *M
 	if useFog && sh.ID > 0 {
 		applyShaderToModel(m, sh, true)
 	}
-	if glbHasAnimations(glbPath) && modelTotalVerts(m) <= 80000 {
+	verts := modelTotalVerts(m)
+	hasAnim := glbHasAnimations(glbPath)
+	if hasAnim && verts <= 80000 {
 		var anims []rl.ModelAnimation
 		func() {
 			defer func() { _ = recover() }()
 			anims = rl.LoadModelAnimations(glbPath)
 		}()
 		if len(anims) > 0 {
+			vlogf("Loaded animated model %s (meshes=%d verts=%d clips=%d)", filepath.Base(glbPath), m.MeshCount, verts, len(anims))
 			return m, &ModelAnimSet{Anims: anims, Frame: 0, LastUpdate: rl.GetTime()}
 		}
+	} else if hasAnim && verts > 80000 {
+		log.Printf("Skipped skeletal animations on %s: vertex count %d exceeds 80000 safety threshold", filepath.Base(glbPath), verts)
 	}
+	vlogf("Loaded static model %s (meshes=%d verts=%d)", filepath.Base(glbPath), m.MeshCount, verts)
 	return m, nil
 }
 
@@ -1569,7 +1586,10 @@ func main() {
 	nickFlag := flag.String("nick", "", "Display nickname (defaults to pubkey prefix)")
 	profileFlag := flag.String("profile", "", "Optional profile suffix (e.g. peer2 -> ~/.vektorweb-client-peer2)")
 	noMicFlag := flag.Bool("nomic", false, "Disable microphone capture (useful for second local test client)")
+	verboseFlag := flag.Bool("verbose", false, "Enable verbose P2P asset, model, and network debug logging")
 	flag.Parse()
+	verboseLog = *verboseFlag
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 
 	worldExplicit := false
 	flag.Visit(func(f *flag.Flag) {
@@ -1599,6 +1619,17 @@ func main() {
 	_ = os.MkdirAll(itemsDir, 0755)
 	_ = os.MkdirAll(exportsDir, 0755)
 
+	clientLogPath := filepath.Join(baseDir, "client.log")
+	if st, err := os.Stat(clientLogPath); err == nil && st.Size() > 5*1024*1024 {
+		_ = os.Rename(clientLogPath, clientLogPath+".1")
+	}
+	if lf, err := os.OpenFile(clientLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+		log.SetOutput(io.MultiWriter(os.Stderr, lf))
+		defer lf.Close()
+	}
+	log.Printf("Starting vektorweb-client (%s/%s, go=%s, dir=%s, verbose=%v)",
+		runtime.GOOS, runtime.GOARCH, runtime.Version(), baseDir, verboseLog)
+
 	settingsPath := filepath.Join(baseDir, "settings.toml")
 	_, settingsStatErr := os.Stat(settingsPath)
 	isFirstRun := os.IsNotExist(settingsStatErr)
@@ -1620,6 +1651,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("identity error: %v", err)
 	}
+	log.Printf("Loaded identity pubkey=%s... targetWorld=%s", kp.PubHex()[:12], targetWorld)
 	nick := sanitizeDisplayText(strings.TrimSpace(*nickFlag), 24)
 	if nick != "" {
 		if cfg.Nick != nick {
@@ -1663,7 +1695,12 @@ func main() {
 	if err != nil {
 		log.Printf("Could not reach %s (%v) -> booting into local://sandbox", targetWorld, err)
 		activeWorld, _ = loadWorldFromURL("local://sandbox", cacheDir)
-	} else if activeWorld.URL != "" && activeWorld.URL != "local://sandbox" && cfg.LastWorld != activeWorld.URL {
+	} else {
+		log.Printf("Loaded world %q (%s) placement=%s max_avatar=%dMB max_item=%dMB",
+			activeWorld.Manifest.World.Title, activeWorld.URL, activeWorld.Manifest.Rules.PlacementMode,
+			activeWorld.Manifest.Rules.MaxAvatarMB, activeWorld.Manifest.Rules.MaxItemMB)
+	}
+	if activeWorld.URL != "" && activeWorld.URL != "local://sandbox" && cfg.LastWorld != activeWorld.URL {
 		cfg.LastWorld = activeWorld.URL
 		saveClientSettings(settingsPath, cfg)
 	}
@@ -5006,8 +5043,24 @@ func handleChatCommand(
 ) {
 	input = strings.TrimSpace(input)
 	if input == "/help" || input == "/?" || strings.HasPrefix(input, "/help ") {
-		ns.addChat("[HELP]: Commands: /help, /uploadavatar, /openavatars, /clear, /range, /back, /history, /clearmyprops, /exportworld, /me <act>, /outfit, /nick, /say, /w, /portal, /bookmark, /setspawn, /copykey")
-		ns.addChat("[HELP]: Keys: [F1] Full Help | [I] Inventory | [G]/[Esc] Build | [C] 3P | [F] Walk/Fly | [H] Waypoint | [1-9] Anim Clip | [R] Spawn | [V] Voice")
+		ns.addChat("[HELP]: Commands: /help, /debug, /uploadavatar, /openavatars, /clear, /range, /back, /history, /clearmyprops, /exportworld, /me <act>, /outfit, /nick, /say, /w, /portal, /bookmark, /setspawn, /copykey")
+		ns.addChat("[HELP]: Keys: [F1] Full Help | [I] Inventory | [G]/[Esc] Build | [C] 3P | [F] Walk/Fly | [H] Waypoint | [0-9] Anim Clip | [R] Spawn | [V] Voice")
+		return
+	}
+	if input == "/debug" {
+		ns.mu.RLock()
+		conn := ns.connected
+		host := ns.relayHost
+		peers := len(ns.peers)
+		props := len(ns.props)
+		asms := len(ns.assemblies)
+		avH := ns.localAvHash
+		ns.mu.RUnlock()
+		logPath := filepath.Join(filepath.Dir(ns.cacheDir), "client.log")
+		diag := fmt.Sprintf("[DEBUG]: FPS=%d conn=%v (%s) peers=%d props=%d dl_active=%d av=%s.. log=%s",
+			rl.GetFPS(), conn, host, peers, props, asms, avH[:minInt(8, len(avH))], logPath)
+		log.Print(diag)
+		ns.addChat(diag)
 		return
 	}
 	if input == "/range" {
@@ -5463,6 +5516,7 @@ func runRelayLoop(ctx context.Context, relayURL string, kp *identity.Keypair, ns
 		}
 		conn, _, err := dialer.DialContext(ctx, relayURL, nil)
 		if err != nil {
+			log.Printf("Relay dial failed (%s): %v (retrying in %v)", relayURL, err, backoff)
 			ns.mu.Lock()
 			ns.connected = false
 			ns.relayHost = u.Hostname()
@@ -5549,6 +5603,7 @@ func runRelaySession(ctx context.Context, conn *websocket.Conn, relayHost string
 	for {
 		msgType, raw, err := conn.ReadMessage()
 		if err != nil {
+			log.Printf("Relay session closed (%s): %v", relayHost, err)
 			return
 		}
 
@@ -5951,6 +6006,7 @@ func handleIncomingChunk(ns *NetState, msg WireMsg) {
 		return
 	}
 
+	log.Printf("Completed P2P asset download %s.glb (%s)", hashLower[:12], formatByteSize(int64(len(full))))
 	outPath := filepath.Join(ns.cacheDir, hashLower+".glb")
 	if err := os.WriteFile(outPath, full, 0644); err == nil {
 		ns.mu.Lock()

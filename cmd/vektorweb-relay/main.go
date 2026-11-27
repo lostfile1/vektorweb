@@ -12,6 +12,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"math"
 	"mime"
@@ -215,6 +216,7 @@ type RelayServer struct {
 	serveHTTP     bool
 	placementMode string
 	trustProxy    bool
+	verbose       bool
 	announceURL   string
 	worldURL      string
 	startedAt     time.Time
@@ -253,7 +255,11 @@ func main() {
 	trustProxy := flag.Bool("trust-proxy", false, "Trust X-Real-IP / X-Forwarded-For headers from a local reverse proxy (Nginx/Caddy)")
 	announceFlag := flag.String("announce", "", "Optional public directory HTTP(S) URL to POST status pings every 60s")
 	adminFlag := flag.String("admin", "", "Comma-separated 64-char hex Ed25519 admin public keys (in addition to world.toml rules.admins)")
+	logFileFlag := flag.String("log", "", "Path to relay log file (defaults to <dir>/relay.log, set 'none' to disable)")
+	verboseFlag := flag.Bool("verbose", false, "Enable verbose P2P chunk, asset, and WebSocket debug logging")
 	flag.Parse()
+
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 
 	switch *placement {
 	case "forbid", "ephemeral", "admin_only", "persistent":
@@ -280,6 +286,20 @@ func main() {
 
 	if err := ensureWorldDir(*worldDir, *addr, resolvedDomain); err != nil {
 		log.Fatalf("failed initializing world folder %s: %v", *worldDir, err)
+	}
+
+	logPath := strings.TrimSpace(*logFileFlag)
+	if logPath == "" {
+		logPath = filepath.Join(*worldDir, "relay.log")
+	}
+	if !strings.EqualFold(logPath, "none") {
+		if st, err := os.Stat(logPath); err == nil && st.Size() > 10*1024*1024 {
+			_ = os.Rename(logPath, logPath+".1")
+		}
+		if lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644); err == nil {
+			log.SetOutput(io.MultiWriter(os.Stderr, lf))
+			defer lf.Close()
+		}
 	}
 
 	cliAdmins := make(map[string]bool)
@@ -312,6 +332,7 @@ func main() {
 		serveHTTP:     *serveHTTP,
 		placementMode: *placement,
 		trustProxy:    *trustProxy,
+		verbose:       *verboseFlag,
 		announceURL:   announceTarget,
 		worldURL:      joinURL,
 		startedAt:     time.Now(),
@@ -352,7 +373,7 @@ func main() {
 
 	log.Printf("vektorweb-relay v%d listening on %s (domain=%s, placement=%s, trust_proxy=%v)",
 		ProtocolVersion, *addr, resolvedDomain, *placement, *trustProxy)
-	log.Printf("World folder : %s", *worldDir)
+	log.Printf("World folder : %s (log=%s, verbose=%v)", *worldDir, logPath, *verboseFlag)
 	if *serveHTTP {
 		log.Printf("Join URL     : %s", joinURL)
 		log.Printf("Status URL   : http://%s:%s/status.json", displayHost, port)
@@ -414,7 +435,19 @@ func (s *RelayServer) stdinAdminLoop() {
 		}
 		switch {
 		case line == "help":
-			log.Printf("Console commands: status | reload | say <msg> | kick <nick|pubkey> | ban <nick|pubkey> | clearprops")
+			log.Printf("Console commands: status | debug | verbose | reload | say <msg> | kick <nick|pubkey> | ban <nick|pubkey> | clearprops")
+		case line == "verbose":
+			s.verbose = !s.verbose
+			log.Printf("Verbose logging toggled -> %v", s.verbose)
+		case line == "debug":
+			s.mu.RLock()
+			log.Printf("Debug: peers=%d props=%d pending_prop_assemblies=%d prop_cache_bytes=%d admins=%d bans=%d blocked_items=%d",
+				len(s.clients), len(s.props), len(s.propAssemblies), s.propCacheDiskUsage(), len(s.adminKeys), len(s.bannedKeys), len(s.blockedItems))
+			for pub, peer := range s.clients {
+				log.Printf("  peer %s (%s...) pos=[%.1f,%.1f,%.1f] av=%s clip=%d scale=%.2f queue=%d/%d",
+					peer.nick, pub[:12], peer.pos[0], peer.pos[1], peer.pos[2], peer.avatarHash[:minIntR(8, len(peer.avatarHash))], peer.animClip, peer.avatarScale, len(peer.send), cap(peer.send))
+			}
+			s.mu.RUnlock()
 		case line == "status":
 			s.mu.RLock()
 			log.Printf("Status: title=%q peers=%d props=%d placement=%s uptime=%ds",
@@ -1388,6 +1421,19 @@ func (s *RelayServer) clientIP(r *http.Request) string {
 	return host
 }
 
+func minIntR(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (s *RelayServer) vlogf(format string, args ...any) {
+	if s.verbose {
+		log.Printf("[VERBOSE] "+format, args...)
+	}
+}
+
 func isValidHex64(s string) bool {
 	if len(s) != 64 {
 		return false
@@ -1450,6 +1496,7 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		log.Printf("WebSocket upgrade failed from %s: %v", ip, err)
 		return
 	}
 	cc := newClientConn(conn)
@@ -1475,6 +1522,7 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 	var auth WireMsg
 	if err := conn.ReadJSON(&auth); err != nil || auth.Type != "AUTH" {
+		log.Printf("Auth handshake failed/timed out from %s (type=%q, err=%v)", ip, auth.Type, err)
 		return
 	}
 
@@ -1652,6 +1700,11 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 	for {
 		msgType, raw, err := conn.ReadMessage()
 		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				log.Printf("Unexpected WebSocket close for %s (%s): %v", cc.nick, auth.PubKey[:12], err)
+			} else {
+				s.vlogf("WebSocket closed for %s (%s): %v", cc.nick, auth.PubKey[:12], err)
+			}
 			break
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(PongWait))
@@ -1735,9 +1788,13 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 				targetOnline := s.clients[msg.TargetPub] != nil
 				s.mu.RUnlock()
 				if targetOnline {
+					s.vlogf("REQ_ASSET %s.. from %s -> direct to %s..", msg.Hash[:12], cc.nick, msg.TargetPub[:12])
 					s.sendTo(msg.TargetPub, msg, false)
 				} else if !s.streamCachedPropToPeer(cc, msg.Hash) {
+					s.vlogf("REQ_ASSET %s.. from %s -> P2P swarm broadcast", msg.Hash[:12], cc.nick)
 					s.broadcast(auth.PubKey, WireMsg{Type: "REQ_ASSET", PubKey: auth.PubKey, Hash: msg.Hash}, false)
+				} else {
+					s.vlogf("REQ_ASSET %s.. from %s -> served from relay prop_cache", msg.Hash[:12], cc.nick)
 				}
 			} else {
 				if !s.streamCachedPropToPeer(cc, msg.Hash) {
@@ -1828,6 +1885,8 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 			s.savePersistentPropsLocked()
 			s.mu.Unlock()
 
+			s.vlogf("PROP_SPAWN id=%s hash=%s.. pos=[%.1f,%.1f,%.1f] scale=%.2f clip=%d by %s",
+				msg.PropID, msg.Hash[:12], msg.Pos[0], msg.Pos[1], msg.Pos[2], msg.Scale, msg.AnimClip, cc.nick)
 			s.requestPropCacheFromClient(cc, auth.PubKey, msg.Hash)
 			s.broadcast(auth.PubKey, msg, false)
 
