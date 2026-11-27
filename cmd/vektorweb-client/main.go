@@ -1464,13 +1464,29 @@ func glbHasAnimations(glbPath string) bool {
 	return len(doc.Animations) > 0
 }
 
+func modelTotalVerts(m rl.Model) int {
+	if m.MeshCount <= 0 || m.Meshes == nil {
+		return 0
+	}
+	meshes := unsafe.Slice(m.Meshes, m.MeshCount)
+	total := 0
+	for i := range meshes {
+		total += int(meshes[i].VertexCount)
+	}
+	return total
+}
+
 func loadModelWithAnims(glbPath string, sh rl.Shader, useFog bool) (rl.Model, *ModelAnimSet) {
 	m := rl.LoadModel(glbPath)
 	if useFog && sh.ID > 0 {
 		applyShaderToModel(m, sh, true)
 	}
-	if glbHasAnimations(glbPath) {
-		anims := rl.LoadModelAnimations(glbPath)
+	if glbHasAnimations(glbPath) && modelTotalVerts(m) <= 80000 {
+		var anims []rl.ModelAnimation
+		func() {
+			defer func() { _ = recover() }()
+			anims = rl.LoadModelAnimations(glbPath)
+		}()
 		if len(anims) > 0 {
 			return m, &ModelAnimSet{Anims: anims, Frame: 0, LastUpdate: rl.GetTime()}
 		}
@@ -2138,6 +2154,34 @@ func main() {
 	isAFK := false
 
 	var pendingDrop *PendingDrop
+	type dialogPickResult struct {
+		path string
+		kind string
+	}
+	pickedGLBCh := make(chan dialogPickResult, 2)
+	var dialogBusyMu sync.Mutex
+	dialogBusy := false
+	launchAsyncGLBPicker := func(title, kind string) {
+		dialogBusyMu.Lock()
+		if dialogBusy {
+			dialogBusyMu.Unlock()
+			netState.addChat("[UPLOAD]: File picker is already open...")
+			return
+		}
+		dialogBusy = true
+		dialogBusyMu.Unlock()
+
+		netState.addChat("[UPLOAD]: Opening file picker (or drag & drop a .glb onto the window)...")
+		go func() {
+			defer func() {
+				dialogBusyMu.Lock()
+				dialogBusy = false
+				dialogBusyMu.Unlock()
+			}()
+			p := pickLocalGLBFileDialog(title)
+			pickedGLBCh <- dialogPickResult{path: p, kind: kind}
+		}()
+	}
 
 	installValidatedGLB := func(fileName, h string, b []byte, kind string, dropLic *identity.AssetLicense) {
 		safeName := sanitizeFileName(fileName)
@@ -2370,6 +2414,21 @@ func main() {
 				}
 			}
 			netState.mu.Unlock()
+		}
+
+		// Non-blocking check for async OS file picker result
+		select {
+		case res := <-pickedGLBCh:
+			if res.path != "" {
+				importLocalGLB(res.path, res.kind)
+			} else {
+				targetFolder := avatarsDir
+				if res.kind == "prop" {
+					targetFolder = itemsDir
+				}
+				netState.addChat("[UPLOAD]: No file chosen (or dialog unavailable). Drag & drop a .glb or use [O] to open " + targetFolder)
+			}
+		default:
 		}
 
 		// File drop handler (.glb) — if [I] Inventory is open on Avatars or Props tab, imports directly into that tab!
@@ -2867,17 +2926,7 @@ func main() {
 					invTab = "avatar"
 					invCursor = 0
 				} else if rl.IsKeyPressed(rl.KeyU) {
-					picked := pickLocalGLBFileDialog("Select .glb " + invTab + " to upload")
-					if picked != "" {
-						importLocalGLB(picked, invTab)
-					} else {
-						targetFolder := itemsDir
-						if invTab == "avatar" {
-							targetFolder = avatarsDir
-						}
-						openLocalFolderOS(targetFolder)
-						netState.addChat("[UPLOAD]: Drop a .glb onto the window or into " + targetFolder)
-					}
+					launchAsyncGLBPicker("Select .glb "+invTab+" to upload", invTab)
 				} else if rl.IsKeyPressed(rl.KeyO) {
 					targetFolder := itemsDir
 					if invTab == "avatar" {
@@ -3393,14 +3442,10 @@ func main() {
 					}
 					if strings.HasPrefix(strings.TrimSpace(chatInput), "/uploadavatar") {
 						argPath := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(chatInput), "/uploadavatar"))
-						if argPath == "" {
-							argPath = pickLocalGLBFileDialog("Select Avatar .glb to Upload")
-						}
 						if argPath != "" {
 							importLocalGLB(argPath, "avatar")
 						} else {
-							openLocalFolderOS(avatarsDir)
-							netState.addChat("[AVATAR]: Opened " + avatarsDir + " — drop any .glb onto the window or into this folder!")
+							launchAsyncGLBPicker("Select Avatar .glb to Upload", "avatar")
 						}
 					} else if strings.TrimSpace(chatInput) == "/openavatars" {
 						openLocalFolderOS(avatarsDir)
@@ -3956,7 +4001,7 @@ func main() {
 				px, py, pw, ph := mx+mw-286, my+68, int32(260), int32(260)
 				rl.BeginTextureMode(invPreviewRT)
 				rl.ClearBackground(rl.NewColor(16, 22, 34, 255))
-				if mod, ok := loadedModels[selItem.Hash]; ok && mod.MeshCount > 0 {
+				if mod, ok := loadedModels[selItem.Hash]; ok && mod.MeshCount > 0 && modelTotalVerts(mod) <= 65000 {
 					bb := rl.GetModelBoundingBox(mod)
 					cx := (bb.Min.X + bb.Max.X) * 0.5
 					cy := (bb.Min.Y + bb.Max.Y) * 0.5
@@ -4379,30 +4424,32 @@ func clampFloat32(v, minV, maxV float32) float32 {
 }
 
 func pickLocalGLBFileDialog(title string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
 	switch runtime.GOOS {
 	case "windows":
 		ps := `Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.OpenFileDialog; $f.Filter = 'glTF Binary (*.glb)|*.glb'; $f.Title = '` + strings.ReplaceAll(title, "'", "") + `'; if ($f.ShowDialog() -eq 'OK') { $f.FileName }`
-		if out, err := exec.Command("powershell", "-NoProfile", "-Command", ps).Output(); err == nil {
+		if out, err := exec.CommandContext(ctx, "powershell", "-NoProfile", "-STA", "-Command", ps).Output(); err == nil {
 			return strings.TrimSpace(string(out))
 		}
 	case "darwin":
 		sc := `POSIX path of (choose file with prompt "` + strings.ReplaceAll(title, `"`, `'`) + `" of type {"glb"})`
-		if out, err := exec.Command("osascript", "-e", sc).Output(); err == nil {
+		if out, err := exec.CommandContext(ctx, "osascript", "-e", sc).Output(); err == nil {
 			return strings.TrimSpace(string(out))
 		}
 	default:
 		if _, err := exec.LookPath("zenity"); err == nil {
-			if out, err := exec.Command("zenity", "--file-selection", "--title="+title, "--file-filter=glTF Binary (*.glb) | *.glb *.GLB").Output(); err == nil {
+			if out, err := exec.CommandContext(ctx, "zenity", "--file-selection", "--title="+title, "--file-filter=glTF Binary (*.glb) | *.glb *.GLB").Output(); err == nil {
 				return strings.TrimSpace(string(out))
 			}
 		}
 		if _, err := exec.LookPath("kdialog"); err == nil {
-			if out, err := exec.Command("kdialog", "--getopenfilename", ".", "*.glb|glTF Binary (*.glb)").Output(); err == nil {
+			if out, err := exec.CommandContext(ctx, "kdialog", "--getopenfilename", ".", "*.glb|glTF Binary (*.glb)").Output(); err == nil {
 				return strings.TrimSpace(string(out))
 			}
 		}
 		if _, err := exec.LookPath("yad"); err == nil {
-			if out, err := exec.Command("yad", "--file", "--title="+title, "--file-filter=*.glb").Output(); err == nil {
+			if out, err := exec.CommandContext(ctx, "yad", "--file", "--title="+title, "--file-filter=*.glb").Output(); err == nil {
 				return strings.TrimSpace(string(out))
 			}
 		}
