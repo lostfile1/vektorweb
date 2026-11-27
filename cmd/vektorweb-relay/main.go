@@ -23,6 +23,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -216,7 +217,7 @@ type RelayServer struct {
 	serveHTTP     bool
 	placementMode string
 	trustProxy    bool
-	verbose       bool
+	verbose       atomic.Bool
 	announceURL   string
 	worldURL      string
 	startedAt     time.Time
@@ -332,7 +333,6 @@ func main() {
 		serveHTTP:     *serveHTTP,
 		placementMode: *placement,
 		trustProxy:    *trustProxy,
-		verbose:       *verboseFlag,
 		announceURL:   announceTarget,
 		worldURL:      joinURL,
 		startedAt:     time.Now(),
@@ -350,6 +350,7 @@ func main() {
 		announcedWorlds: make(map[string]StatusResponse),
 	}
 
+	srv.verbose.Store(*verboseFlag)
 	srv.reloadConfigFiles(true)
 
 	if *placement == "persistent" || *placement == "admin_only" {
@@ -437,8 +438,9 @@ func (s *RelayServer) stdinAdminLoop() {
 		case line == "help":
 			log.Printf("Console commands: status | debug | verbose | reload | say <msg> | kick <nick|pubkey> | ban <nick|pubkey> | clearprops")
 		case line == "verbose":
-			s.verbose = !s.verbose
-			log.Printf("Verbose logging toggled -> %v", s.verbose)
+			nv := !s.verbose.Load()
+			s.verbose.Store(nv)
+			log.Printf("Verbose logging toggled -> %v", nv)
 		case line == "debug":
 			s.mu.RLock()
 			log.Printf("Debug: peers=%d props=%d pending_prop_assemblies=%d prop_cache_bytes=%d admins=%d bans=%d blocked_items=%d",
@@ -1243,7 +1245,7 @@ func (s *RelayServer) handleRelayCacheChunk(senderPub string, msg WireMsg) bool 
 		return true
 	}
 	if s.propCacheDiskUsage()+int64(len(full)) > MaxTotalPropCacheBytes {
-		log.Printf("Skipped caching prop %s: prop_cache 256MB limit reached", hLower[:12])
+		log.Printf("Skipped caching prop %s: prop_cache %dMB limit reached", hLower[:12], MaxTotalPropCacheBytes/(1024*1024))
 		return true
 	}
 	_ = os.MkdirAll(filepath.Join(s.worldDir, "prop_cache"), 0755)
@@ -1429,7 +1431,7 @@ func minIntR(a, b int) int {
 }
 
 func (s *RelayServer) vlogf(format string, args ...any) {
-	if s.verbose {
+	if s.verbose.Load() {
 		log.Printf("[VERBOSE] "+format, args...)
 	}
 }

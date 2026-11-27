@@ -16,12 +16,15 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -37,7 +40,7 @@ import (
 const (
 	MaxWorldManifestBytes = 256 * 1024
 	MaxWorldScriptBytes   = 256 * 1024
-	MaxDefaultEnvBytes    = 50 * 1024 * 1024
+	MaxDefaultEnvBytes    = 25 * 1024 * 1024
 )
 
 type WorldPortal struct {
@@ -624,14 +627,10 @@ func (n *NetState) addChat(line string) {
 
 func (n *NetState) resetSessionForPortal() {
 	n.mu.Lock()
-	if n.relayCancel != nil {
-		n.relayCancel()
-		n.relayCancel = nil
-	}
-	if n.conn != nil {
-		_ = n.conn.Close()
-		n.conn = nil
-	}
+	cancelFn := n.relayCancel
+	n.relayCancel = nil
+	c := n.conn
+	n.conn = nil
 	n.connected = false
 	n.liveSpawn = nil
 	n.peers = make(map[string]*RemotePeer)
@@ -643,6 +642,20 @@ func (n *NetState) resetSessionForPortal() {
 	n.pendingRecvFiles = make(map[string]*PendingIncomingFile)
 	n.voiceQueue = nil
 	n.mu.Unlock()
+
+	if c != nil {
+		n.writeMu.Lock()
+		_ = c.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+		_ = c.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "closing session"))
+		n.writeMu.Unlock()
+	}
+	if cancelFn != nil {
+		cancelFn()
+	}
+	if c != nil {
+		_ = c.Close()
+	}
 }
 
 type LoadedWorld struct {
@@ -1194,10 +1207,10 @@ func licensePathForGLB(glbPath string) string {
 	return glbPath + ".license.json"
 }
 
-var verboseLog bool
+var verboseLog atomic.Bool
 
 func vlogf(format string, args ...any) {
-	if verboseLog {
+	if verboseLog.Load() {
 		log.Printf("[VERBOSE] "+format, args...)
 	}
 }
@@ -1491,24 +1504,6 @@ void main() {
 	return sh, viewPosLoc, fogColorLoc
 }
 
-func applyShaderToModel(m rl.Model, sh rl.Shader, enable bool) {
-	if m.MeshCount <= 0 || m.MaterialCount <= 0 || m.Materials == nil {
-		return
-	}
-	mats := unsafe.Slice(m.Materials, m.MaterialCount)
-	var fallback rl.Shader
-	if !enable || sh.ID == 0 {
-		fallback = rl.LoadShader("", "")
-	}
-	for i := range mats {
-		if enable && sh.ID > 0 {
-			mats[i].Shader = sh
-		} else {
-			mats[i].Shader = fallback
-		}
-	}
-}
-
 // glbHasAnimations inspects the glTF 2.0 JSON chunk of a .glb file to check
 // whether any animation channels exist before calling rl.LoadModelAnimations.
 // In raylib-go v0.63.0, LoadModelAnimations panics when the C function returns
@@ -1550,8 +1545,11 @@ func modelTotalVerts(m rl.Model) int {
 
 func loadModelWithAnims(glbPath string, sh rl.Shader, useFog bool) (rl.Model, *ModelAnimSet) {
 	m := rl.LoadModel(glbPath)
-	if useFog && sh.ID > 0 {
-		applyShaderToModel(m, sh, true)
+	if useFog && sh.ID > 0 && m.MeshCount > 0 && m.MaterialCount > 0 && m.Materials != nil {
+		mats := unsafe.Slice(m.Materials, m.MaterialCount)
+		for i := range mats {
+			mats[i].Shader = sh
+		}
 	}
 	verts := modelTotalVerts(m)
 	hasAnim := glbHasAnimations(glbPath)
@@ -1588,7 +1586,7 @@ func main() {
 	noMicFlag := flag.Bool("nomic", false, "Disable microphone capture (useful for second local test client)")
 	verboseFlag := flag.Bool("verbose", false, "Enable verbose P2P asset, model, and network debug logging")
 	flag.Parse()
-	verboseLog = *verboseFlag
+	verboseLog.Store(*verboseFlag)
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 
 	worldExplicit := false
@@ -1628,7 +1626,7 @@ func main() {
 		defer lf.Close()
 	}
 	log.Printf("Starting vektorweb-client (%s/%s, go=%s, dir=%s, verbose=%v)",
-		runtime.GOOS, runtime.GOARCH, runtime.Version(), baseDir, verboseLog)
+		runtime.GOOS, runtime.GOARCH, runtime.Version(), baseDir, verboseLog.Load())
 
 	settingsPath := filepath.Join(baseDir, "settings.toml")
 	_, settingsStatErr := os.Stat(settingsPath)
@@ -2068,8 +2066,12 @@ func main() {
 		if maxItemMB > 24 {
 			maxItemMB = 24
 		}
+		effMaxMB := maxAvMB
+		if maxItemMB > effMaxMB {
+			effMaxMB = maxItemMB
+		}
 		netState.mu.Lock()
-		netState.maxAssetB = maxAvMB * 1024 * 1024
+		netState.maxAssetB = effMaxMB * 1024 * 1024
 		netState.mu.Unlock()
 		ghostActive = false
 		ownedPropIDs = nil
@@ -2422,7 +2424,20 @@ func main() {
 	cursorLocked := true
 	rl.DisableCursor()
 
-	for !rl.WindowShouldClose() {
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	var signalExit atomic.Bool
+	go func() {
+		sig, ok := <-sigCh
+		if ok {
+			log.Printf("Received signal %v — closing session cleanly...", sig)
+			signalExit.Store(true)
+			netState.resetSessionForPortal()
+		}
+	}()
+
+	for !rl.WindowShouldClose() && !signalExit.Load() {
 		sw := int32(rl.GetScreenWidth())
 		sh := int32(rl.GetScreenHeight())
 
@@ -4645,6 +4660,7 @@ func main() {
 
 		rl.EndDrawing()
 	}
+	netState.resetSessionForPortal()
 }
 
 var (
@@ -5468,6 +5484,7 @@ func handleChatCommand(
 			Nick:       curN,
 			Pos:        []float32{pos.X, pos.Y, pos.Z},
 			AvatarHash: curH,
+			Scale:      cfg.AvatarScale,
 		})
 		ns.addChat(fmt.Sprintf("[OUTFIT]: Loaded slot %q -> %s", slot, formatPeerTag(curN, kp.PubHex())))
 		return
