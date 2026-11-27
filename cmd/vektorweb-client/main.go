@@ -686,40 +686,106 @@ func resolveRelativeAssetURL(baseWorldURL, assetRef string) (string, error) {
 	return strings.TrimRight(baseWorldURL, "/") + cleaned, nil
 }
 
-func buildDefaultGLB(w, h, d float32) []byte {
-	hw, hh, hd := w/2, h, d/2
-	verts := []float32{
-		-hw, 0, -hd, hw, 0, -hd, hw, 0, hd, -hw, 0, hd,
-		-hw * 0.85, hh, -hd * 0.85, hw * 0.85, hh, -hd * 0.85, hw * 0.85, hh, hd * 0.85, -hw * 0.85, hh, hd * 0.85,
+type starterMeshBuilder struct {
+	pos  []float32
+	norm []float32
+	col  []float32
+	idx  []uint16
+	minV [3]float32
+	maxV [3]float32
+}
+
+func newStarterMeshBuilder() *starterMeshBuilder {
+	return &starterMeshBuilder{
+		minV: [3]float32{1e9, 1e9, 1e9},
+		maxV: [3]float32{-1e9, -1e9, -1e9},
 	}
-	indices := []uint16{
-		0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6, 0, 4, 5, 0, 5, 1,
-		1, 5, 6, 1, 6, 2, 2, 6, 7, 2, 7, 3, 3, 7, 4, 3, 4, 0,
+}
+
+func (mb *starterMeshBuilder) addQuad(p0, p1, p2, p3, n [3]float32, c [4]float32) {
+	base := uint16(len(mb.pos) / 3)
+	for _, p := range [4][3]float32{p0, p1, p2, p3} {
+		mb.pos = append(mb.pos, p[0], p[1], p[2])
+		mb.norm = append(mb.norm, n[0], n[1], n[2])
+		mb.col = append(mb.col, c[0], c[1], c[2], c[3])
+		for k := 0; k < 3; k++ {
+			if p[k] < mb.minV[k] {
+				mb.minV[k] = p[k]
+			}
+			if p[k] > mb.maxV[k] {
+				mb.maxV[k] = p[k]
+			}
+		}
 	}
-	vBytes := make([]byte, len(verts)*4)
-	for i, v := range verts {
-		binary.LittleEndian.PutUint32(vBytes[i*4:], math.Float32bits(v))
+	mb.idx = append(mb.idx, base, base+1, base+2, base, base+2, base+3)
+}
+
+func (mb *starterMeshBuilder) addBox(cx, cy, cz, sx, sy, sz float32, cTop, cSide [4]float32) {
+	hx, hy, hz := sx*0.5, sy*0.5, sz*0.5
+	x0, x1 := cx-hx, cx+hx
+	y0, y1 := cy-hy, cy+hy
+	z0, z1 := cz-hz, cz+hz
+	mb.addQuad([3]float32{x0, y1, z1}, [3]float32{x1, y1, z1}, [3]float32{x1, y1, z0}, [3]float32{x0, y1, z0}, [3]float32{0, 1, 0}, cTop)
+	mb.addQuad([3]float32{x0, y0, z0}, [3]float32{x1, y0, z0}, [3]float32{x1, y0, z1}, [3]float32{x0, y0, z1}, [3]float32{0, -1, 0}, cSide)
+	mb.addQuad([3]float32{x0, y0, z1}, [3]float32{x1, y0, z1}, [3]float32{x1, y1, z1}, [3]float32{x0, y1, z1}, [3]float32{0, 0, 1}, cSide)
+	mb.addQuad([3]float32{x1, y0, z0}, [3]float32{x0, y0, z0}, [3]float32{x0, y1, z0}, [3]float32{x1, y1, z0}, [3]float32{0, 0, -1}, cSide)
+	mb.addQuad([3]float32{x1, y0, z1}, [3]float32{x1, y0, z0}, [3]float32{x1, y1, z0}, [3]float32{x1, y1, z1}, [3]float32{1, 0, 0}, cSide)
+	mb.addQuad([3]float32{x0, y0, z0}, [3]float32{x0, y0, z1}, [3]float32{x0, y1, z1}, [3]float32{x0, y1, z0}, [3]float32{-1, 0, 0}, cSide)
+}
+
+func (mb *starterMeshBuilder) encodeGLB() []byte {
+	vCount := len(mb.pos) / 3
+	pBytes := make([]byte, len(mb.pos)*4)
+	for i, v := range mb.pos {
+		binary.LittleEndian.PutUint32(pBytes[i*4:], math.Float32bits(v))
 	}
-	iBytes := make([]byte, len(indices)*2)
-	for i, idx := range indices {
-		binary.LittleEndian.PutUint16(iBytes[i*2:], idx)
+	nBytes := make([]byte, len(mb.norm)*4)
+	for i, v := range mb.norm {
+		binary.LittleEndian.PutUint32(nBytes[i*4:], math.Float32bits(v))
 	}
-	binBuf := append(vBytes, iBytes...)
+	cBytes := make([]byte, len(mb.col)*4)
+	for i, v := range mb.col {
+		binary.LittleEndian.PutUint32(cBytes[i*4:], math.Float32bits(v))
+	}
+	iBytes := make([]byte, len(mb.idx)*2)
+	for i, id := range mb.idx {
+		binary.LittleEndian.PutUint16(iBytes[i*2:], id)
+	}
+	for len(iBytes)%4 != 0 {
+		iBytes = append(iBytes, 0, 0)
+	}
+
+	var binBuf []byte
+	pOff := 0
+	binBuf = append(binBuf, pBytes...)
+	nOff := len(binBuf)
+	binBuf = append(binBuf, nBytes...)
+	cOff := len(binBuf)
+	binBuf = append(binBuf, cBytes...)
+	iOff := len(binBuf)
+	binBuf = append(binBuf, iBytes...)
 
 	gltf := map[string]any{
-		"asset":   map[string]string{"version": "2.0"},
-		"scene":   0,
-		"scenes":  []any{map[string]any{"nodes": []int{0}}},
-		"nodes":   []any{map[string]int{"mesh": 0}},
-		"meshes":  []any{map[string]any{"primitives": []any{map[string]any{"attributes": map[string]int{"POSITION": 0}, "indices": 1}}}},
+		"asset":  map[string]string{"version": "2.0"},
+		"scene":  0,
+		"scenes": []any{map[string]any{"nodes": []int{0}}},
+		"nodes":  []any{map[string]int{"mesh": 0}},
+		"meshes": []any{map[string]any{"primitives": []any{map[string]any{
+			"attributes": map[string]int{"POSITION": 0, "NORMAL": 1, "COLOR_0": 2},
+			"indices":    3,
+		}}}},
 		"buffers": []any{map[string]int{"byteLength": len(binBuf)}},
 		"bufferViews": []any{
-			map[string]int{"buffer": 0, "byteOffset": 0, "byteLength": len(vBytes)},
-			map[string]int{"buffer": 0, "byteOffset": len(vBytes), "byteLength": len(iBytes)},
+			map[string]int{"buffer": 0, "byteOffset": pOff, "byteLength": len(pBytes), "target": 34962},
+			map[string]int{"buffer": 0, "byteOffset": nOff, "byteLength": len(nBytes), "target": 34962},
+			map[string]int{"buffer": 0, "byteOffset": cOff, "byteLength": len(cBytes), "target": 34962},
+			map[string]int{"buffer": 0, "byteOffset": iOff, "byteLength": len(mb.idx) * 2, "target": 34963},
 		},
 		"accessors": []any{
-			map[string]any{"bufferView": 0, "componentType": 5126, "count": 8, "type": "VEC3", "min": []float32{-hw, 0, -hd}, "max": []float32{hw, hh, hd}},
-			map[string]any{"bufferView": 1, "componentType": 5123, "count": 36, "type": "SCALAR"},
+			map[string]any{"bufferView": 0, "componentType": 5126, "count": vCount, "type": "VEC3", "min": []float32{mb.minV[0], mb.minV[1], mb.minV[2]}, "max": []float32{mb.maxV[0], mb.maxV[1], mb.maxV[2]}},
+			map[string]any{"bufferView": 1, "componentType": 5126, "count": vCount, "type": "VEC3"},
+			map[string]any{"bufferView": 2, "componentType": 5126, "count": vCount, "type": "VEC4"},
+			map[string]any{"bufferView": 3, "componentType": 5123, "count": len(mb.idx), "type": "SCALAR"},
 		},
 	}
 	jBytes, _ := json.Marshal(gltf)
@@ -739,6 +805,71 @@ func buildDefaultGLB(w, h, d float32) []byte {
 	binary.LittleEndian.PutUint32(out[bOff+4:bOff+8], 0x004E4942)
 	copy(out[bOff+8:], binBuf)
 	return out
+}
+
+func buildStarterAvatarGLB(style string) []byte {
+	mb := newStarterMeshBuilder()
+	var primary, second, accent, dark [4]float32
+	switch style {
+	case "nomad":
+		primary = [4]float32{0.25, 0.20, 0.14, 1.0}
+		second = [4]float32{0.36, 0.29, 0.20, 1.0}
+		accent = [4]float32{0.96, 0.72, 0.18, 1.0}
+		dark = [4]float32{0.11, 0.09, 0.07, 1.0}
+	case "oracle":
+		primary = [4]float32{0.24, 0.13, 0.17, 1.0}
+		second = [4]float32{0.34, 0.18, 0.24, 1.0}
+		accent = [4]float32{0.96, 0.26, 0.42, 1.0}
+		dark = [4]float32{0.11, 0.06, 0.08, 1.0}
+	default: // "sentinel"
+		primary = [4]float32{0.14, 0.20, 0.29, 1.0}
+		second = [4]float32{0.22, 0.29, 0.40, 1.0}
+		accent = [4]float32{0.15, 0.86, 0.96, 1.0}
+		dark = [4]float32{0.07, 0.10, 0.15, 1.0}
+	}
+
+	// Boots & Legs (Y: 0.00 -> 0.78)
+	mb.addBox(-0.12, 0.07, 0.03, 0.14, 0.14, 0.19, second, dark)
+	mb.addBox(0.12, 0.07, 0.03, 0.14, 0.14, 0.19, second, dark)
+	mb.addBox(-0.12, 0.46, 0, 0.12, 0.64, 0.12, primary, dark)
+	mb.addBox(0.12, 0.46, 0, 0.12, 0.64, 0.12, primary, dark)
+
+	// Pelvis, Torso & Chest Core (Y: 0.78 -> 1.34)
+	mb.addBox(0, 0.84, 0, 0.42, 0.14, 0.24, dark, dark)
+	mb.addBox(0, 1.12, 0, 0.46, 0.44, 0.26, primary, second)
+	mb.addBox(0, 1.15, 0.145, 0.20, 0.18, 0.03, accent, accent)
+	mb.addBox(0, 1.14, -0.18, 0.26, 0.30, 0.12, second, dark)
+
+	// Shoulders & Arms (Y: 0.80 -> 1.32)
+	mb.addBox(-0.31, 1.26, 0, 0.18, 0.16, 0.18, second, accent)
+	mb.addBox(0.31, 1.26, 0, 0.18, 0.16, 0.18, second, accent)
+	mb.addBox(-0.31, 0.98, 0, 0.11, 0.42, 0.11, primary, dark)
+	mb.addBox(0.31, 0.98, 0, 0.11, 0.42, 0.11, primary, dark)
+
+	// Neck & Head (Y: 1.34 -> 1.70)
+	mb.addBox(0, 1.37, 0, 0.14, 0.08, 0.14, dark, dark)
+	mb.addBox(0, 1.54, 0, 0.30, 0.28, 0.30, primary, second)
+	mb.addBox(0, 1.55, 0.16, 0.26, 0.08, 0.03, accent, accent)
+
+	switch style {
+	case "nomad":
+		mb.addBox(0, 1.72, 0, 0.06, 0.10, 0.32, accent, accent)
+	case "oracle":
+		mb.addBox(0, 1.75, 0, 0.34, 0.03, 0.04, accent, accent)
+		mb.addBox(0, 1.75, 0, 0.04, 0.03, 0.34, accent, accent)
+	default:
+		mb.addBox(-0.17, 1.55, 0, 0.04, 0.12, 0.12, second, accent)
+		mb.addBox(0.17, 1.55, 0, 0.04, 0.12, 0.12, second, accent)
+	}
+	return mb.encodeGLB()
+}
+
+func buildDefaultGLB(w, h, d float32) []byte {
+	mb := newStarterMeshBuilder()
+	mb.addBox(0, h*0.5, 0, w, h, d,
+		[4]float32{0.20, 0.28, 0.39, 1.0},
+		[4]float32{0.12, 0.17, 0.25, 1.0})
+	return mb.encodeGLB()
 }
 
 // safeSpawnPosition raycasts downward from above the requested spawn point against
@@ -1419,9 +1550,20 @@ func main() {
 		nick = kp.PubHex()[:8]
 	}
 
-	defaultAvPath := filepath.Join(avatarsDir, "avatar.glb")
-	if _, err := os.Stat(defaultAvPath); os.IsNotExist(err) {
-		_ = os.WriteFile(defaultAvPath, buildDefaultGLB(0.6, 1.7, 0.4), 0644)
+	defaultAvPath := filepath.Join(avatarsDir, "sentinel_cyan.glb")
+	starterAvatars := []struct {
+		file  string
+		style string
+	}{
+		{"sentinel_cyan.glb", "sentinel"},
+		{"nomad_amber.glb", "nomad"},
+		{"oracle_crimson.glb", "oracle"},
+	}
+	for _, sa := range starterAvatars {
+		p := filepath.Join(avatarsDir, sa.file)
+		if _, err := os.Stat(p); os.IsNotExist(err) {
+			_ = os.WriteFile(p, buildStarterAvatarGLB(sa.style), 0644)
+		}
 	}
 	defaultPropPath := filepath.Join(itemsDir, "crate.glb")
 	if _, err := os.Stat(defaultPropPath); os.IsNotExist(err) {
@@ -1984,7 +2126,6 @@ func main() {
 	ghostScale := float32(1.0)
 	showRangeRing := false
 	dirCursor := 0
-	var pendingDrop *PendingDrop
 
 	chatInput := ""
 	var chatHistory []string
@@ -1995,6 +2136,119 @@ func main() {
 	lastJanitor := time.Now()
 	lastActivity := time.Now()
 	isAFK := false
+
+	var pendingDrop *PendingDrop
+
+	installValidatedGLB := func(fileName, h string, b []byte, kind string, dropLic *identity.AssetLicense) {
+		safeName := sanitizeFileName(fileName)
+		if kind == "avatar" {
+			destP := filepath.Join(avatarsDir, safeName)
+			_ = os.WriteFile(destP, b, 0644)
+			cachedP := filepath.Join(cacheDir, h+".glb")
+			_ = os.WriteFile(cachedP, b, 0644)
+			if dropLic != nil {
+				_ = identity.SaveAssetLicense(licensePathForGLB(destP), dropLic)
+			}
+			if _, exists := loadedModels[h]; !exists {
+				m, a := loadModelWithAnims(cachedP, fogShader, cfg.EnableFog)
+				loadedModels[h] = m
+				if a != nil {
+					loadedAnims[h] = a
+				}
+			}
+			netState.mu.Lock()
+			netState.localAvHash = h
+			netState.localAvBytes = b
+			netState.localAssets[h] = b
+			netState.mu.Unlock()
+			localAvHash = h
+			cfg.AvatarHash = h
+			saveClientSettings(settingsPath, cfg)
+			avatarInv = scanInventoryFolder(avatarsDir, "avatar", cacheDir, kp.PubHex(), maxAvMB*1024*1024, localAssets)
+			populateInventoryBounds(avatarInv, loadedModels)
+			netState.addChat("[AVATAR]: Equipped & saved " + safeName + "!")
+			return
+		}
+		destP := filepath.Join(itemsDir, safeName)
+		_ = os.WriteFile(destP, b, 0644)
+		cachedP := filepath.Join(cacheDir, h+".glb")
+		_ = os.WriteFile(cachedP, b, 0644)
+		if dropLic != nil {
+			_ = identity.SaveAssetLicense(licensePathForGLB(destP), dropLic)
+		}
+		netState.mu.Lock()
+		netState.localAssets[h] = b
+		netState.mu.Unlock()
+		if _, exists := loadedModels[h]; !exists {
+			m, a := loadModelWithAnims(cachedP, fogShader, cfg.EnableFog)
+			loadedModels[h] = m
+			if a != nil {
+				loadedAnims[h] = a
+			}
+		}
+		propInv = scanInventoryFolder(itemsDir, "prop", cacheDir, kp.PubHex(), maxItemMB*1024*1024, localAssets)
+		populateInventoryBounds(propInv, loadedModels)
+		for i, it := range propInv {
+			if it.Hash == h {
+				propIdx = i
+				break
+			}
+		}
+		ghostActive = true
+		netState.addChat("[INVENTORY]: Added " + safeName + " & armed Ghost [P]!")
+	}
+
+	importLocalGLB := func(fpath string, autoKind string) {
+		fpath = strings.TrimSpace(strings.Trim(fpath, `"'`))
+		if fpath == "" {
+			return
+		}
+		if !strings.HasSuffix(strings.ToLower(fpath), ".glb") {
+			netState.addChat("[UPLOAD ERR]: Only .glb files are supported")
+			return
+		}
+		b, err := os.ReadFile(fpath)
+		if err != nil {
+			netState.addChat("[UPLOAD ERR]: Could not read " + filepath.Base(fpath))
+			return
+		}
+		limitBytes := maxAvMB * 1024 * 1024
+		if autoKind == "prop" {
+			limitBytes = maxItemMB * 1024 * 1024
+		}
+		if err := glbguard.ValidateGLB(b, limitBytes); err != nil {
+			netState.addChat("[GLBGUARD]: " + err.Error())
+			return
+		}
+		h := identity.FileSHA256(b)
+		var dropLic *identity.AssetLicense
+		if lic, err := identity.LoadAssetLicense(licensePathForGLB(fpath)); err == nil {
+			if err := lic.Verify(h, kp.PubHex()); err != nil {
+				netState.addChat("[LICENSE ERR]: " + err.Error())
+				return
+			}
+			dropLic = lic
+			_ = os.Remove(worldOnlyMarkerPath(cacheDir, h))
+			_ = identity.SaveAssetLicense(filepath.Join(cacheDir, h+".license.json"), lic)
+		} else if lic, err := identity.LoadAssetLicense(filepath.Join(cacheDir, h+".license.json")); err == nil && lic.Verify(h, kp.PubHex()) == nil {
+			dropLic = lic
+			_ = os.Remove(worldOnlyMarkerPath(cacheDir, h))
+		}
+		if dropLic == nil && isWorldOnlyAsset(cacheDir, h) {
+			netState.addChat("[DRM]: Cannot import display-only world/peer asset without a creator license!")
+			return
+		}
+		safeName := sanitizeFileName(filepath.Base(fpath))
+		if autoKind == "avatar" || autoKind == "prop" {
+			installValidatedGLB(safeName, h, b, autoKind, dropLic)
+			return
+		}
+		pendingDrop = &PendingDrop{
+			FileName: safeName,
+			Hash:     h,
+			Bytes:    b,
+		}
+	}
 
 	rl.SetExitKey(0)
 	cursorLocked := true
@@ -2118,46 +2372,15 @@ func main() {
 			netState.mu.Unlock()
 		}
 
-		// File drop handler (.glb)
+		// File drop handler (.glb) — if [I] Inventory is open on Avatars or Props tab, imports directly into that tab!
 		if rl.IsFileDropped() {
 			dropped := rl.LoadDroppedFiles()
 			for _, fpath := range dropped {
-				if !strings.HasSuffix(strings.ToLower(fpath), ".glb") {
-					netState.addChat("[DROP ERR]: Only .glb files are supported")
-					continue
+				autoKind := ""
+				if invOpen {
+					autoKind = invTab
 				}
-				b, err := os.ReadFile(fpath)
-				if err != nil {
-					netState.addChat("[DROP ERR]: Could not read " + filepath.Base(fpath))
-					continue
-				}
-				if err := glbguard.ValidateGLB(b, maxAvMB*1024*1024); err != nil {
-					netState.addChat("[GLBGUARD]: " + err.Error())
-					continue
-				}
-				h := identity.FileSHA256(b)
-				var dropLic *identity.AssetLicense
-				if lic, err := identity.LoadAssetLicense(licensePathForGLB(fpath)); err == nil {
-					if err := lic.Verify(h, kp.PubHex()); err != nil {
-						netState.addChat("[LICENSE ERR]: " + err.Error())
-						continue
-					}
-					dropLic = lic
-					_ = os.Remove(worldOnlyMarkerPath(cacheDir, h))
-					_ = identity.SaveAssetLicense(filepath.Join(cacheDir, h+".license.json"), lic)
-				} else if lic, err := identity.LoadAssetLicense(filepath.Join(cacheDir, h+".license.json")); err == nil && lic.Verify(h, kp.PubHex()) == nil {
-					dropLic = lic
-					_ = os.Remove(worldOnlyMarkerPath(cacheDir, h))
-				}
-				if dropLic == nil && isWorldOnlyAsset(cacheDir, h) {
-					netState.addChat("[DRM]: Cannot import display-only world/peer asset without a creator license!")
-					continue
-				}
-				pendingDrop = &PendingDrop{
-					FileName: sanitizeFileName(filepath.Base(fpath)),
-					Hash:     h,
-					Bytes:    b,
-				}
+				importLocalGLB(fpath, autoKind)
 				break
 			}
 			rl.UnloadDroppedFiles()
@@ -2165,64 +2388,12 @@ func main() {
 
 		if pendingDrop != nil {
 			if rl.IsKeyPressed(rl.KeyOne) {
-				destP := filepath.Join(avatarsDir, pendingDrop.FileName)
-				_ = os.WriteFile(destP, pendingDrop.Bytes, 0644)
-				cachedP := filepath.Join(cacheDir, pendingDrop.Hash+".glb")
-				_ = os.WriteFile(cachedP, pendingDrop.Bytes, 0644)
-				if lic, err := identity.LoadAssetLicense(filepath.Join(cacheDir, pendingDrop.Hash+".license.json")); err == nil {
-					_ = identity.SaveAssetLicense(licensePathForGLB(destP), lic)
-				}
-
-				if _, exists := loadedModels[pendingDrop.Hash]; !exists {
-					m, a := loadModelWithAnims(cachedP, fogShader, cfg.EnableFog)
-					loadedModels[pendingDrop.Hash] = m
-					if a != nil {
-						loadedAnims[pendingDrop.Hash] = a
-					}
-				}
-
-				netState.mu.Lock()
-				netState.localAvHash = pendingDrop.Hash
-				netState.localAvBytes = pendingDrop.Bytes
-				netState.localAssets[pendingDrop.Hash] = pendingDrop.Bytes
-				netState.mu.Unlock()
-				localAvHash = pendingDrop.Hash
-
-				cfg.AvatarHash = pendingDrop.Hash
-				saveClientSettings(settingsPath, cfg)
-				avatarInv = scanInventoryFolder(avatarsDir, "avatar", cacheDir, kp.PubHex(), maxAvMB*1024*1024, localAssets)
-				netState.addChat("[AVATAR]: Equipped & saved " + pendingDrop.FileName + "!")
+				lic, _ := identity.LoadAssetLicense(filepath.Join(cacheDir, pendingDrop.Hash+".license.json"))
+				installValidatedGLB(pendingDrop.FileName, pendingDrop.Hash, pendingDrop.Bytes, "avatar", lic)
 				pendingDrop = nil
 			} else if rl.IsKeyPressed(rl.KeyTwo) {
-				destP := filepath.Join(itemsDir, pendingDrop.FileName)
-				_ = os.WriteFile(destP, pendingDrop.Bytes, 0644)
-				cachedP := filepath.Join(cacheDir, pendingDrop.Hash+".glb")
-				_ = os.WriteFile(cachedP, pendingDrop.Bytes, 0644)
-				if lic, err := identity.LoadAssetLicense(filepath.Join(cacheDir, pendingDrop.Hash+".license.json")); err == nil {
-					_ = identity.SaveAssetLicense(licensePathForGLB(destP), lic)
-				}
-
-				netState.mu.Lock()
-				netState.localAssets[pendingDrop.Hash] = pendingDrop.Bytes
-				netState.mu.Unlock()
-
-				if _, exists := loadedModels[pendingDrop.Hash]; !exists {
-					m, a := loadModelWithAnims(cachedP, fogShader, cfg.EnableFog)
-					loadedModels[pendingDrop.Hash] = m
-					if a != nil {
-						loadedAnims[pendingDrop.Hash] = a
-					}
-				}
-				propInv = scanInventoryFolder(itemsDir, "prop", cacheDir, kp.PubHex(), maxItemMB*1024*1024, localAssets)
-				for i, it := range propInv {
-					if it.Hash == pendingDrop.Hash {
-						propIdx = i
-						break
-					}
-				}
-				ghostActive = true
-
-				netState.addChat("[INVENTORY]: Added " + pendingDrop.FileName + " & armed Ghost [P]!")
+				lic, _ := identity.LoadAssetLicense(filepath.Join(cacheDir, pendingDrop.Hash+".license.json"))
+				installValidatedGLB(pendingDrop.FileName, pendingDrop.Hash, pendingDrop.Bytes, "prop", lic)
 				pendingDrop = nil
 			} else if rl.IsKeyPressed(rl.KeyEscape) {
 				pendingDrop = nil
@@ -2695,6 +2866,25 @@ func main() {
 				} else if rl.IsKeyPressed(rl.KeyTwo) {
 					invTab = "avatar"
 					invCursor = 0
+				} else if rl.IsKeyPressed(rl.KeyU) {
+					picked := pickLocalGLBFileDialog("Select .glb " + invTab + " to upload")
+					if picked != "" {
+						importLocalGLB(picked, invTab)
+					} else {
+						targetFolder := itemsDir
+						if invTab == "avatar" {
+							targetFolder = avatarsDir
+						}
+						openLocalFolderOS(targetFolder)
+						netState.addChat("[UPLOAD]: Drop a .glb onto the window or into " + targetFolder)
+					}
+				} else if rl.IsKeyPressed(rl.KeyO) {
+					targetFolder := itemsDir
+					if invTab == "avatar" {
+						targetFolder = avatarsDir
+					}
+					openLocalFolderOS(targetFolder)
+					netState.addChat("[INVENTORY]: Opened folder " + targetFolder)
 				}
 
 				if rl.IsKeyPressed(rl.KeyDown) || rl.IsKeyPressed(rl.KeyS) {
@@ -3201,7 +3391,23 @@ func main() {
 							chatHistory = chatHistory[len(chatHistory)-25:]
 						}
 					}
-					handleChatCommand(chatInput, kp, netState, hopToWorld, &visitedWorlds, &showRangeRing, &avatarInv, &propInv, &localAvHash, exportsDir, &spawn, playerHeadPos, activeWorld.URL, activeWorld.Manifest.World.Title, worldModel, &cfg, settingsPath, &directory, dirPath)
+					if strings.HasPrefix(strings.TrimSpace(chatInput), "/uploadavatar") {
+						argPath := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(chatInput), "/uploadavatar"))
+						if argPath == "" {
+							argPath = pickLocalGLBFileDialog("Select Avatar .glb to Upload")
+						}
+						if argPath != "" {
+							importLocalGLB(argPath, "avatar")
+						} else {
+							openLocalFolderOS(avatarsDir)
+							netState.addChat("[AVATAR]: Opened " + avatarsDir + " — drop any .glb onto the window or into this folder!")
+						}
+					} else if strings.TrimSpace(chatInput) == "/openavatars" {
+						openLocalFolderOS(avatarsDir)
+						netState.addChat("[AVATAR]: Opened " + avatarsDir)
+					} else {
+						handleChatCommand(chatInput, kp, netState, hopToWorld, &visitedWorlds, &showRangeRing, &avatarInv, &propInv, &localAvHash, exportsDir, &spawn, playerHeadPos, activeWorld.URL, activeWorld.Manifest.World.Title, worldModel, &cfg, settingsPath, &directory, dirPath)
+					}
 					chatInput = ""
 				}
 				chatHistIdx = len(chatHistory)
@@ -3867,7 +4073,7 @@ func main() {
 						drawUIText(truncateToWidth(rowTxt, 15, mw-330), mx+24, my+int32(88+i*32), 15, col)
 					}
 				}
-				drawUIText("[Up/Dn] Select | [Enter] Equip/Arm | [R] Transfer | [D] Delete | [I/Esc] Close", mx+24, my+mh-34, 15, rl.Gray)
+				drawUIText("[Up/Dn] Select | [Enter] Equip | [U] Upload .glb | [O] Open Folder | [R] Send | [D] Del", mx+24, my+mh-34, 15, rl.Gray)
 			}
 		}
 
@@ -4047,7 +4253,7 @@ func main() {
 			drawGlassPanel(mx, my, mw, mh, rl.Gold, 246)
 			drawUITextShadow("VEKTORWEB CONTROLS & SLASH COMMANDS", mx+26, my+18, 19, rl.Gold)
 			helpLines := []string{
-				"[I]              : Local Inventory ([R] to Transfer/Sell signed item)",
+				"[I]              : Local Inventory ([U] Upload .glb | [O] Open folder | [R] Send)",
 				"Drag & Drop .glb : Equip avatar or import prop into inventory",
 				"WASD + Mouse     : Walk / Look ([Shift] Sprint, [Space] Jump, [F] Walk/Fly)",
 				"[C] / [R]        : Toggle 3rd-Person View (Wheel zooms) / Return to Spawn",
@@ -4170,6 +4376,55 @@ func clampFloat32(v, minV, maxV float32) float32 {
 		return maxV
 	}
 	return v
+}
+
+func pickLocalGLBFileDialog(title string) string {
+	switch runtime.GOOS {
+	case "windows":
+		ps := `Add-Type -AssemblyName System.Windows.Forms; $f = New-Object System.Windows.Forms.OpenFileDialog; $f.Filter = 'glTF Binary (*.glb)|*.glb'; $f.Title = '` + strings.ReplaceAll(title, "'", "") + `'; if ($f.ShowDialog() -eq 'OK') { $f.FileName }`
+		if out, err := exec.Command("powershell", "-NoProfile", "-Command", ps).Output(); err == nil {
+			return strings.TrimSpace(string(out))
+		}
+	case "darwin":
+		sc := `POSIX path of (choose file with prompt "` + strings.ReplaceAll(title, `"`, `'`) + `" of type {"glb"})`
+		if out, err := exec.Command("osascript", "-e", sc).Output(); err == nil {
+			return strings.TrimSpace(string(out))
+		}
+	default:
+		if _, err := exec.LookPath("zenity"); err == nil {
+			if out, err := exec.Command("zenity", "--file-selection", "--title="+title, "--file-filter=glTF Binary (*.glb) | *.glb *.GLB").Output(); err == nil {
+				return strings.TrimSpace(string(out))
+			}
+		}
+		if _, err := exec.LookPath("kdialog"); err == nil {
+			if out, err := exec.Command("kdialog", "--getopenfilename", ".", "*.glb|glTF Binary (*.glb)").Output(); err == nil {
+				return strings.TrimSpace(string(out))
+			}
+		}
+		if _, err := exec.LookPath("yad"); err == nil {
+			if out, err := exec.Command("yad", "--file", "--title="+title, "--file-filter=*.glb").Output(); err == nil {
+				return strings.TrimSpace(string(out))
+			}
+		}
+	}
+	return ""
+}
+
+func openLocalFolderOS(dir string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("explorer", dir)
+	case "darwin":
+		cmd = exec.Command("open", dir)
+	default:
+		if _, err := exec.LookPath("xdg-open"); err == nil {
+			cmd = exec.Command("xdg-open", dir)
+		}
+	}
+	if cmd != nil && cmd.Start() == nil {
+		go func() { _ = cmd.Wait() }()
+	}
 }
 
 func setClipboardSafe(text string) bool {
@@ -4413,7 +4668,7 @@ func handleChatCommand(
 ) {
 	input = strings.TrimSpace(input)
 	if input == "/help" || input == "/?" || strings.HasPrefix(input, "/help ") {
-		ns.addChat("[HELP]: Commands: /help, /clear, /range, /back, /history, /clearmyprops, /exportworld, /me <act>, /outfit, /nick, /say, /w, /portal, /bookmark, /setspawn, /copykey")
+		ns.addChat("[HELP]: Commands: /help, /uploadavatar, /openavatars, /clear, /range, /back, /history, /clearmyprops, /exportworld, /me <act>, /outfit, /nick, /say, /w, /portal, /bookmark, /setspawn, /copykey")
 		ns.addChat("[HELP]: Keys: [F1] Full Help | [I] Inventory | [G]/[Esc] Build | [C] 3P | [F] Walk/Fly | [H] Waypoint | [1-9] Anim Clip | [R] Spawn | [V] Voice")
 		return
 	}
