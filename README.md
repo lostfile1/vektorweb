@@ -176,7 +176,8 @@ radius = 1.8
 ## Contributing & Security
 
 - Read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting pull requests.
-- Read [SECURITY.md](SECURITY.md) for reporting vulnerabilities in `glbguard`, `luavm`, Ed25519 challenge verification, or relay networking.
+- Read [SECURITY.md](SECURITY.md) for reporting vulnerabilities in `glbguard`, `luavm`, Ed25519
+- Read [PROTOCOL.md](PROTOCOL.md) if you want to roll your own client.
 
 ---
 
