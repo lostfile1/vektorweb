@@ -12,6 +12,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"math"
@@ -47,32 +48,41 @@ const (
 	OutboundQueueSize  = 128
 )
 
+type WorldPortal struct {
+	Name   string    `toml:"name" json:"name"`
+	URL    string    `toml:"url" json:"url"`
+	Pos    []float32 `toml:"pos" json:"pos"`
+	Radius float32   `toml:"radius" json:"radius"`
+}
+
 type WireMsg struct {
-	Type         string    `json:"type"`
-	ProtoVersion int       `json:"proto_version,omitempty"`
-	Capabilities []string  `json:"capabilities,omitempty"`
-	Nonce        string    `json:"nonce,omitempty"`
-	Timestamp    int64     `json:"timestamp,omitempty"`
-	PubKey       string    `json:"pubkey,omitempty"`
-	TargetPub    string    `json:"target_pub,omitempty"`
-	Signature    string    `json:"signature,omitempty"`
-	AvatarHash   string    `json:"avatar_hash,omitempty"`
-	Nick         string    `json:"nick,omitempty"`
-	Pos          []float32 `json:"pos,omitempty"`
-	Yaw          float32   `json:"yaw,omitempty"`
-	Pitch        float32   `json:"pitch,omitempty"`
-	Roll         float32   `json:"roll,omitempty"`
-	Hash         string    `json:"hash,omitempty"`
-	Seq          int       `json:"seq,omitempty"`
-	Total        int       `json:"total,omitempty"`
-	Data         string    `json:"data,omitempty"`
-	Text         string    `json:"text,omitempty"`
-	Channel      string    `json:"channel,omitempty"`
-	PropID       string    `json:"prop_id,omitempty"`
-	Scale        float32   `json:"scale,omitempty"`
-	AnimClip     int       `json:"anim_clip,omitempty"`
-	Code         string    `json:"code,omitempty"`
-	Message      string    `json:"message,omitempty"`
+	Type         string        `json:"type"`
+	ProtoVersion int           `json:"proto_version,omitempty"`
+	Capabilities []string      `json:"capabilities,omitempty"`
+	Nonce        string        `json:"nonce,omitempty"`
+	Timestamp    int64         `json:"timestamp,omitempty"`
+	PubKey       string        `json:"pubkey,omitempty"`
+	HWID         string        `json:"hwid,omitempty"`
+	TargetPub    string        `json:"target_pub,omitempty"`
+	Signature    string        `json:"signature,omitempty"`
+	AvatarHash   string        `json:"avatar_hash,omitempty"`
+	Nick         string        `json:"nick,omitempty"`
+	Pos          []float32     `json:"pos,omitempty"`
+	Yaw          float32       `json:"yaw,omitempty"`
+	Pitch        float32       `json:"pitch,omitempty"`
+	Roll         float32       `json:"roll,omitempty"`
+	Hash         string        `json:"hash,omitempty"`
+	Seq          int           `json:"seq,omitempty"`
+	Total        int           `json:"total,omitempty"`
+	Data         string        `json:"data,omitempty"`
+	Text         string        `json:"text,omitempty"`
+	Channel      string        `json:"channel,omitempty"`
+	PropID       string        `json:"prop_id,omitempty"`
+	Scale        float32       `json:"scale,omitempty"`
+	AnimClip     int           `json:"anim_clip,omitempty"`
+	Portals      []WorldPortal `json:"portals,omitempty"`
+	Code         string        `json:"code,omitempty"`
+	Message      string        `json:"message,omitempty"`
 }
 
 type WorldBakedProp struct {
@@ -96,8 +106,15 @@ type WorldConfigTOML struct {
 	Rules struct {
 		PlacementMode string   `toml:"placement_mode"`
 		Admins        []string `toml:"admins"`
+		FederatedBans *bool    `toml:"federated_bans"`
+		BanFeeds      []string `toml:"ban_feeds"`
 	} `toml:"rules"`
-	Props []WorldBakedProp `toml:"props"`
+	Audio struct {
+		StreamURL string `toml:"stream_url"`
+		Title     string `toml:"title"`
+	} `toml:"audio"`
+	Portals []WorldPortal    `toml:"portals"`
+	Props   []WorldBakedProp `toml:"props"`
 }
 
 type StatusResponse struct {
@@ -127,6 +144,8 @@ type ClientConn struct {
 	send         chan outboundFrame
 	closeOnce    sync.Once
 	pubKey       string
+	hwID         string
+	ip           string
 	nick         string
 	avatarHash   string
 	animClip     int
@@ -226,11 +245,23 @@ type RelayServer struct {
 	worldTitle      string
 	worldMOTD       string
 	worldSpawn      []float32
-	adminKeys       map[string]bool
-	cliAdmins       map[string]bool
+	worldPortals    []WorldPortal
+	radioURL        string
+	radioTitle      string
+	adminKeys         map[string]bool
+	cliAdmins         map[string]bool
+	firstAdminClaimed bool
 	bannedKeys      map[string]bool
+	federatedBans   bool
+	banFeeds        []string
+	fedBannedKeys   map[string]bool
+	lastFedSyncAt   time.Time
+	bannedIPs       map[string]bool
+	bannedHWIDs     map[string]bool
 	blockedItems    map[string]bool
 	bansModTime     time.Time
+	ipBansModTime   time.Time
+	hwBansModTime   time.Time
 	blockedModTime  time.Time
 	tomlModTime     time.Time
 	clients         map[string]*ClientConn
@@ -342,6 +373,10 @@ func main() {
 		adminKeys:     make(map[string]bool),
 		cliAdmins:     cliAdmins,
 		bannedKeys:    make(map[string]bool),
+		federatedBans: true,
+		fedBannedKeys: make(map[string]bool),
+		bannedIPs:     make(map[string]bool),
+		bannedHWIDs:   make(map[string]bool),
 		blockedItems:  make(map[string]bool),
 		clients:         make(map[string]*ClientConn),
 		props:           make(map[string]WireMsg),
@@ -436,7 +471,13 @@ func (s *RelayServer) stdinAdminLoop() {
 		}
 		switch {
 		case line == "help":
-			log.Printf("Console commands: status | debug | verbose | reload | say <msg> | kick <nick|pubkey> | ban <nick|pubkey> | clearprops")
+			log.Printf("Console commands: status | debug | verbose | reload | say <msg> | kick <nick|pubkey> | ban <nick|pubkey> | unban <pubkey|ip|hwid> | clearprops")
+		case strings.HasPrefix(line, "unban "):
+			tok := strings.TrimSpace(strings.TrimPrefix(line, "unban "))
+			s.mu.Lock()
+			n := s.removeBanTokenLocked(tok)
+			s.mu.Unlock()
+			log.Printf("Unban %q -> removed %d entry/entries", tok, n)
 		case line == "verbose":
 			nv := !s.verbose.Load()
 			s.verbose.Store(nv)
@@ -498,6 +539,12 @@ func (s *RelayServer) stdinAdminLoop() {
 			}
 			if isBan && target != nil {
 				s.appendBanKeyLocked(target.pubKey)
+		if target.ip != "" {
+			s.appendBanIPLocked(target.ip)
+		}
+		if isValidHex64(target.hwID) {
+			s.appendBanHWIDLocked(target.hwID)
+		}
 			} else if isBan && isValidHex64(qLower) {
 				s.appendBanKeyLocked(qLower)
 			}
@@ -531,7 +578,93 @@ func (s *RelayServer) watchLoop() {
 	defer ticker.Stop()
 	for range ticker.C {
 		s.reloadConfigFiles(false)
+		s.syncFederatedBanFeeds(false)
 		s.pruneStaleAssemblies()
+	}
+}
+
+func (s *RelayServer) syncFederatedBanFeeds(force bool) {
+	s.mu.RLock()
+	enabled := s.federatedBans
+	feeds := append([]string(nil), s.banFeeds...)
+	lastSync := s.lastFedSyncAt
+	s.mu.RUnlock()
+
+	if !enabled || len(feeds) == 0 {
+		s.mu.Lock()
+		s.fedBannedKeys = make(map[string]bool)
+		s.mu.Unlock()
+		return
+	}
+	if !force && !lastSync.IsZero() && time.Since(lastSync) < 60*time.Second {
+		return
+	}
+
+	httpClient := &http.Client{Timeout: 5 * time.Second}
+	merged := make(map[string]bool)
+
+	for _, rawURL := range feeds {
+		u := strings.TrimSpace(rawURL)
+		if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+			continue
+		}
+		resp, err := httpClient.Get(u)
+		if err != nil {
+			s.vlogf("Federated ban feed fetch skipped (%s): %v", u, err)
+			continue
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || readErr != nil {
+			continue
+		}
+
+		var parsed struct {
+			Bans []string `json:"bans"`
+		}
+		addedFromJSON := false
+		if json.Unmarshal(body, &parsed) == nil && len(parsed.Bans) > 0 {
+			for _, k := range parsed.Bans {
+				kl := strings.ToLower(strings.TrimSpace(k))
+				if isValidHex64(kl) {
+					merged[kl] = true
+					addedFromJSON = true
+				}
+			}
+		}
+		if !addedFromJSON {
+			for _, line := range strings.Split(string(body), "\n") {
+				clean := strings.TrimSpace(line)
+				if clean == "" || strings.HasPrefix(clean, "#") {
+					continue
+				}
+				fields := strings.Fields(clean)
+				if len(fields) > 0 && isValidHex64(strings.ToLower(fields[0])) {
+					merged[strings.ToLower(fields[0])] = true
+				}
+			}
+		}
+	}
+
+	s.mu.Lock()
+	s.lastFedSyncAt = time.Now()
+	s.fedBannedKeys = merged
+	var toKick []*ClientConn
+	if s.federatedBans {
+		for pub, cc := range s.clients {
+			if merged[strings.ToLower(pub)] {
+				toKick = append(toKick, cc)
+			}
+		}
+	}
+	s.mu.Unlock()
+
+	for _, cc := range toKick {
+		s.sendError(cc, "ERR_BANNED", "public key matched an active federated ban feed")
+		go func(target *ClientConn) {
+			time.Sleep(50 * time.Millisecond)
+			target.close()
+		}(cc)
 	}
 }
 
@@ -544,10 +677,14 @@ func fileModTime(path string) time.Time {
 
 func (s *RelayServer) reloadConfigFiles(force bool) {
 	bansPath := filepath.Join(s.worldDir, "bans.txt")
+	ipBansPath := filepath.Join(s.worldDir, "banned_ips.txt")
+	hwBansPath := filepath.Join(s.worldDir, "banned_hwids.txt")
 	blockedPath := filepath.Join(s.worldDir, "blocked_items.txt")
 	tomlPath := filepath.Join(s.worldDir, "world.toml")
 
 	bMod := fileModTime(bansPath)
+	ipMod := fileModTime(ipBansPath)
+	hwMod := fileModTime(hwBansPath)
 	iMod := fileModTime(blockedPath)
 	tMod := fileModTime(tomlPath)
 
@@ -559,6 +696,24 @@ func (s *RelayServer) reloadConfigFiles(force bool) {
 		s.bannedKeys = loadFlatSet(bansPath)
 		for pub, cc := range s.clients {
 			if s.bannedKeys[strings.ToLower(pub)] || s.bannedKeys[pub] {
+				toKick = append(toKick, cc)
+			}
+		}
+	}
+	if force || !ipMod.Equal(s.ipBansModTime) {
+		s.ipBansModTime = ipMod
+		s.bannedIPs = loadFlatSet(ipBansPath)
+		for _, cc := range s.clients {
+			if cc.ip != "" && s.bannedIPs[cc.ip] {
+				toKick = append(toKick, cc)
+			}
+		}
+	}
+	if force || !hwMod.Equal(s.hwBansModTime) {
+		s.hwBansModTime = hwMod
+		s.bannedHWIDs = loadFlatSet(hwBansPath)
+		for _, cc := range s.clients {
+			if cc.hwID != "" && s.bannedHWIDs[strings.ToLower(cc.hwID)] {
 				toKick = append(toKick, cc)
 			}
 		}
@@ -581,6 +736,26 @@ func (s *RelayServer) reloadConfigFiles(force bool) {
 				if finiteVec3(wc.World.Spawn) {
 					s.worldSpawn = append([]float32(nil), wc.World.Spawn...)
 				}
+				s.radioURL = strings.TrimSpace(wc.Audio.StreamURL)
+				s.radioTitle = sanitizeControlChars(wc.Audio.Title, 48)
+				var loadedPortals []WorldPortal
+				for _, wp := range wc.Portals {
+					u := strings.TrimSpace(wp.URL)
+					if u == "" || !finiteVec3(wp.Pos) {
+						continue
+					}
+					rad := wp.Radius
+					if rad <= 0 {
+						rad = 1.6
+					}
+					loadedPortals = append(loadedPortals, WorldPortal{
+						Name:   sanitizeControlChars(wp.Name, 40),
+						URL:    u,
+						Pos:    []float32{wp.Pos[0], wp.Pos[1], wp.Pos[2]},
+						Radius: rad,
+					})
+				}
+				s.worldPortals = loadedPortals
 				admins := make(map[string]bool, len(s.cliAdmins)+len(wc.Rules.Admins))
 				for k := range s.cliAdmins {
 					admins[k] = true
@@ -592,10 +767,26 @@ func (s *RelayServer) reloadConfigFiles(force bool) {
 					}
 				}
 				s.adminKeys = admins
+				if len(s.adminKeys) > 0 || len(s.cliAdmins) > 0 {
+					s.firstAdminClaimed = true
+				} else if _, err := os.Stat(filepath.Join(s.worldDir, ".first_admin_claimed")); err == nil {
+					s.firstAdminClaimed = true
+				}
 				pm := strings.ToLower(strings.TrimSpace(wc.Rules.PlacementMode))
 				if pm == "forbid" || pm == "ephemeral" || pm == "admin_only" || pm == "persistent" {
 					s.placementMode = pm
 				}
+				if wc.Rules.FederatedBans != nil {
+					s.federatedBans = *wc.Rules.FederatedBans
+				}
+				var cleanFeeds []string
+				for _, fu := range wc.Rules.BanFeeds {
+					fu = strings.TrimSpace(fu)
+					if strings.HasPrefix(fu, "http://") || strings.HasPrefix(fu, "https://") {
+						cleanFeeds = append(cleanFeeds, fu)
+					}
+				}
+				s.banFeeds = cleanFeeds
 
 				// Sync baked [[props]] defined in world.toml (prefixed "baked_")
 				activeBaked := make(map[string]bool)
@@ -745,8 +936,15 @@ admins = []
 
 	bansPath := filepath.Join(dir, "bans.txt")
 	if _, err := os.Stat(bansPath); os.IsNotExist(err) {
-		_ = os.WriteFile(bansPath, []byte(`# Add banned Ed25519 public keys (one 64-char hex key per line)
-`), 0644)
+		_ = os.WriteFile(bansPath, []byte("# Add banned Ed25519 public keys (one 64-char hex key per line)\n"), 0644)
+	}
+	ipBansPath := filepath.Join(dir, "banned_ips.txt")
+	if _, err := os.Stat(ipBansPath); os.IsNotExist(err) {
+		_ = os.WriteFile(ipBansPath, []byte("# Add banned client IPs (one IP per line)\n"), 0644)
+	}
+	hwBansPath := filepath.Join(dir, "banned_hwids.txt")
+	if _, err := os.Stat(hwBansPath); os.IsNotExist(err) {
+		_ = os.WriteFile(hwBansPath, []byte("# Add banned hardware fingerprint hashes (one 64-char hex hash per line)\n"), 0644)
 	}
 
 	blockedPath := filepath.Join(dir, "blocked_items.txt")
@@ -1050,6 +1248,126 @@ func (s *RelayServer) handleDirectory(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(DirectoryResponse{Worlds: list})
 }
 
+func (s *RelayServer) handleLandingPage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.mu.RLock()
+	title := s.worldTitle
+	motd := s.worldMOTD
+	domain := s.domain
+	worldURL := s.worldURL
+	placement := s.placementMode
+	online := len(s.clients)
+	props := len(s.props)
+	portals := append([]WorldPortal(nil), s.worldPortals...)
+	radioTitle := s.radioTitle
+	radioURL := s.radioURL
+	s.mu.RUnlock()
+
+	uptime := int64(time.Since(s.startedAt).Seconds())
+	vektorLink := strings.Replace(worldURL, "https://", "vektorweb://", 1)
+	vektorLink = strings.Replace(vektorLink, "http://", "vektorweb://", 1)
+
+	var portalHTML strings.Builder
+	if len(portals) == 0 {
+		portalHTML.WriteString(`<li class="muted">No active portals configured in world.toml</li>`)
+	} else {
+		for _, p := range portals {
+			name := html.EscapeString(p.Name)
+			if name == "" {
+				name = html.EscapeString(p.URL)
+			}
+			uEsc := html.EscapeString(p.URL)
+			fmt.Fprintf(&portalHTML, `<li><strong>%s</strong> <span class="mono">(%s)</span></li>`, name, uEsc)
+		}
+	}
+
+	motdBlock := ""
+	if motd != "" {
+		motdBlock = fmt.Sprintf(`<div class="motd">%s</div>`, html.EscapeString(motd))
+	}
+	radioBlock := `<span class="muted">Off</span>`
+	if radioURL != "" {
+		rLabel := radioTitle
+		if rLabel == "" {
+			rLabel = radioURL
+		}
+		radioBlock = fmt.Sprintf(`<span class="ok">%s</span>`, html.EscapeString(rLabel))
+	}
+
+	page := fmt.Sprintf(`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>%s — VektorWeb Node</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: #0b0e15; color: #e2e8f0; display: flex; justify-content: center; padding: 32px 16px; }
+  .card { max-width: 720px; width: 100%%; background: #111726; border: 1px solid #26354f; border-top: 3px solid #38bdf8; border-radius: 10px; padding: 24px 28px; box-shadow: 0 14px 36px rgba(0,0,0,0.45); }
+  h1 { margin: 0 0 6px; font-size: 1.45rem; color: #f8fafc; }
+  .sub { color: #38bdf8; font-size: 0.9rem; margin-bottom: 16px; }
+  .motd { background: #162033; border-left: 3px solid #facc15; padding: 10px 14px; border-radius: 6px; margin-bottom: 18px; color: #fef08a; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .stat { background: #0d1320; border: 1px solid #1e2b42; border-radius: 8px; padding: 12px; }
+  .stat .k { font-size: 0.75rem; color: #94a3b8; text-transform: uppercase; }
+  .stat .v { font-size: 1.15rem; color: #4ade80; font-weight: 700; margin-top: 4px; }
+  .join-box { background: #0d1320; border: 1px solid #2b4263; border-radius: 8px; padding: 14px; margin-bottom: 18px; }
+  .mono { color: #7dd3fc; word-break: break-all; font-size: 0.88rem; }
+  .muted { color: #64748b; }
+  .ok { color: #4ade80; }
+  ul { margin: 8px 0 0; padding-left: 20px; }
+  li { margin: 4px 0; }
+  a { color: #38bdf8; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>%s</h1>
+  <div class="sub">VektorWeb Relay Node &bull; %s &bull; Protocol v%d</div>
+  %s
+  <div class="grid">
+    <div class="stat"><div class="k">Peers Online</div><div class="v">%d</div></div>
+    <div class="stat"><div class="k">World Props</div><div class="v">%d</div></div>
+    <div class="stat"><div class="k">Placement</div><div class="v">%s</div></div>
+    <div class="stat"><div class="k">Uptime</div><div class="v">%ds</div></div>
+  </div>
+  <div class="join-box">
+    <div class="k" style="color:#94a3b8;font-size:0.75rem;margin-bottom:6px;">CONNECT IN VEKTORWEB CLIENT ([Tab] &rarr; [N])</div>
+    <div class="mono">%s</div>
+    <div class="mono" style="margin-top:4px;color:#94a3b8;">Manifest: <a href="/world.toml">%s</a> &bull; <a href="/status.json">/status.json</a> &bull; <a href="/directory.json">/directory.json</a></div>
+  </div>
+  <div style="margin-bottom:14px;"><strong>World Radio:</strong> %s</div>
+  <div><strong>Active Portals:</strong><ul>%s</ul></div>
+</div>
+</body>
+</html>`,
+		html.EscapeString(title),
+		html.EscapeString(title),
+		html.EscapeString(domain),
+		ProtocolVersion,
+		motdBlock,
+		online,
+		props,
+		html.EscapeString(placement),
+		uptime,
+		html.EscapeString(vektorLink),
+		html.EscapeString(worldURL),
+		radioBlock,
+		portalHTML.String(),
+	)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method == http.MethodHead {
+		return
+	}
+	_, _ = w.Write([]byte(page))
+}
+
 func (s *RelayServer) handleRoot(w http.ResponseWriter, r *http.Request) {
 	if websocket.IsWebSocketUpgrade(r) {
 		s.handleWS(w, r)
@@ -1061,6 +1379,10 @@ func (s *RelayServer) handleRoot(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/directory.json" {
 		s.handleDirectory(w, r)
+		return
+	}
+	if r.URL.Path == "/index.html" || (r.URL.Path == "/" && r.URL.Query().Get("raw") != "1" && strings.Contains(r.Header.Get("Accept"), "text/html")) {
+		s.handleLandingPage(w, r)
 		return
 	}
 	if !s.serveHTTP {
@@ -1075,7 +1397,7 @@ func (s *RelayServer) handleRoot(w http.ResponseWriter, r *http.Request) {
 
 	cleanPath := filepath.Clean("/" + r.URL.Path)
 	base := filepath.Base(cleanPath)
-	if strings.HasPrefix(cleanPath, "/prop_cache") || base == "bans.txt" || base == "blocked_items.txt" || base == "world_props.json" || strings.HasPrefix(base, ".") {
+	if strings.HasPrefix(cleanPath, "/prop_cache") || base == "bans.txt" || base == "banned_ips.txt" || base == "banned_hwids.txt" || base == "blocked_items.txt" || base == "world_props.json" || strings.HasPrefix(base, ".") {
 		http.NotFound(w, r)
 		return
 	}
@@ -1330,6 +1652,69 @@ func (s *RelayServer) savePersistentPropsLocked() {
 	}
 }
 
+func (s *RelayServer) persistFirstAdminLocked(pubHex string) error {
+	pubHex = strings.ToLower(strings.TrimSpace(pubHex))
+	if !isValidHex64(pubHex) {
+		return errors.New("invalid pubkey")
+	}
+	_ = os.WriteFile(filepath.Join(s.worldDir, ".first_admin_claimed"), []byte(pubHex+"\n"), 0644)
+	tomlPath := filepath.Join(s.worldDir, "world.toml")
+	raw, err := os.ReadFile(tomlPath)
+	if err != nil {
+		return err
+	}
+	adminLine := fmt.Sprintf("admins = [%q]", pubHex)
+	lines := strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n")
+	replaced := false
+	inRules := false
+	rulesEndIdx := -1
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") && !strings.HasPrefix(trimmed, "[[") {
+			if inRules && rulesEndIdx == -1 {
+				rulesEndIdx = i
+			}
+			inRules = (trimmed == "[rules]")
+			continue
+		}
+		if inRules && strings.HasPrefix(trimmed, "admins") {
+			rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "admins"))
+			if strings.HasPrefix(rest, "=") {
+				lines[i] = adminLine
+				replaced = true
+				break
+			}
+		}
+	}
+	if !replaced {
+		if rulesEndIdx > 0 {
+			newLines := make([]string, 0, len(lines)+1)
+			newLines = append(newLines, lines[:rulesEndIdx]...)
+			newLines = append(newLines, adminLine)
+			newLines = append(newLines, lines[rulesEndIdx:]...)
+			lines = newLines
+			replaced = true
+		} else if inRules {
+			lines = append(lines, adminLine)
+			replaced = true
+		} else {
+			lines = append(lines, "", "[rules]", adminLine)
+			replaced = true
+		}
+	}
+	if replaced {
+		tmpPath := tomlPath + ".tmp"
+		if err := os.WriteFile(tmpPath, []byte(strings.Join(lines, "\n")), 0644); err != nil {
+			return err
+		}
+		if err := os.Rename(tmpPath, tomlPath); err != nil {
+			return err
+		}
+		s.tomlModTime = fileModTime(tomlPath)
+	}
+	return nil
+}
+
 func (s *RelayServer) updateWorldSpawnLocked(pos []float32) error {
 	if !finiteVec3(pos) {
 		return errors.New("invalid spawn coordinates")
@@ -1387,6 +1772,101 @@ func (s *RelayServer) updateWorldSpawnLocked(pos []float32) error {
 	return nil
 }
 
+func (s *RelayServer) updateWorldPortalsLocked(portals []WorldPortal) error {
+	tomlPath := filepath.Join(s.worldDir, "world.toml")
+	raw, err := os.ReadFile(tomlPath)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n")
+	var out []string
+	skipPortalBlock := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[[") && strings.HasSuffix(trimmed, "]]") {
+			skipPortalBlock = (trimmed == "[[portals]]")
+			if skipPortalBlock {
+				continue
+			}
+		} else if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			skipPortalBlock = false
+		}
+		if skipPortalBlock {
+			continue
+		}
+		out = append(out, line)
+	}
+	for len(out) > 0 && strings.TrimSpace(out[len(out)-1]) == "" {
+		out = out[:len(out)-1]
+	}
+	for _, p := range portals {
+		rad := p.Radius
+		if rad <= 0 {
+			rad = 1.6
+		}
+		out = append(out, "", "[[portals]]",
+			fmt.Sprintf("name = %q", p.Name),
+			fmt.Sprintf("url = %q", p.URL),
+			fmt.Sprintf("pos = [%.2f, %.2f, %.2f]", p.Pos[0], p.Pos[1], p.Pos[2]),
+			fmt.Sprintf("radius = %.2f", rad),
+		)
+	}
+	out = append(out, "")
+	tmpPath := tomlPath + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(strings.Join(out, "\n")), 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, tomlPath); err != nil {
+		return err
+	}
+	s.tomlModTime = fileModTime(tomlPath)
+	s.worldPortals = append([]WorldPortal(nil), portals...)
+	return nil
+}
+
+func (s *RelayServer) updateWorldAudioLocked(streamURL, title string) error {
+	tomlPath := filepath.Join(s.worldDir, "world.toml")
+	raw, err := os.ReadFile(tomlPath)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n")
+	var out []string
+	inAudio := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			inAudio = (trimmed == "[audio]")
+			if inAudio {
+				continue
+			}
+		}
+		if inAudio {
+			continue
+		}
+		out = append(out, line)
+	}
+	for len(out) > 0 && strings.TrimSpace(out[len(out)-1]) == "" {
+		out = out[:len(out)-1]
+	}
+	out = append(out, "", "[audio]",
+		fmt.Sprintf("stream_url = %q", streamURL),
+		fmt.Sprintf("title = %q", title),
+		"",
+	)
+	tmpPath := tomlPath + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(strings.Join(out, "\n")), 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, tomlPath); err != nil {
+		return err
+	}
+	s.tomlModTime = fileModTime(tomlPath)
+	s.radioURL = streamURL
+	s.radioTitle = title
+	return nil
+}
+
 func (s *RelayServer) appendBanKeyLocked(pubKey string) {
 	pubKey = strings.ToLower(strings.TrimSpace(pubKey))
 	if !isValidHex64(pubKey) || s.bannedKeys[pubKey] {
@@ -1400,6 +1880,174 @@ func (s *RelayServer) appendBanKeyLocked(pubKey string) {
 		_ = f.Close()
 		s.bansModTime = fileModTime(bansPath)
 	}
+}
+
+func (s *RelayServer) appendBanIPLocked(ip string) {
+	ip = strings.TrimSpace(ip)
+	if ip == "" || s.bannedIPs[ip] {
+		return
+	}
+	s.bannedIPs[ip] = true
+	p := filepath.Join(s.worldDir, "banned_ips.txt")
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err == nil {
+		_, _ = fmt.Fprintf(f, "%s # banned via admin command at %s\n", ip, time.Now().UTC().Format(time.RFC3339))
+		_ = f.Close()
+		s.ipBansModTime = fileModTime(p)
+	}
+}
+
+func (s *RelayServer) appendBanHWIDLocked(hwID string) {
+	hwID = strings.ToLower(strings.TrimSpace(hwID))
+	if !isValidHex64(hwID) || s.bannedHWIDs[hwID] {
+		return
+	}
+	s.bannedHWIDs[hwID] = true
+	p := filepath.Join(s.worldDir, "banned_hwids.txt")
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err == nil {
+		_, _ = fmt.Fprintf(f, "%s # banned via admin command at %s\n", hwID, time.Now().UTC().Format(time.RFC3339))
+		_ = f.Close()
+		s.hwBansModTime = fileModTime(p)
+	}
+}
+
+func removeTokenFromFlatFile(path, tokenLower string) int {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	lines := strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n")
+	var out []string
+	removed := 0
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+			fields := strings.Fields(trimmed)
+			if len(fields) > 0 && strings.ToLower(fields[0]) == tokenLower {
+				removed++
+				continue
+			}
+		}
+		out = append(out, line)
+	}
+	if removed > 0 {
+		tmp := path + ".tmp"
+		if os.WriteFile(tmp, []byte(strings.Join(out, "\n")), 0644) == nil {
+			_ = os.Rename(tmp, path)
+		}
+	}
+	return removed
+}
+
+func (s *RelayServer) removeBanTokenLocked(token string) int {
+	tokLower := strings.ToLower(strings.TrimSpace(token))
+	if tokLower == "" {
+		return 0
+	}
+	totalRemoved := 0
+	delete(s.bannedKeys, tokLower)
+	delete(s.bannedKeys, strings.TrimSpace(token))
+	delete(s.bannedIPs, strings.TrimSpace(token))
+	delete(s.bannedIPs, tokLower)
+	delete(s.bannedHWIDs, tokLower)
+
+	bansPath := filepath.Join(s.worldDir, "bans.txt")
+	if n := removeTokenFromFlatFile(bansPath, tokLower); n > 0 {
+		totalRemoved += n
+		s.bansModTime = fileModTime(bansPath)
+	}
+	ipPath := filepath.Join(s.worldDir, "banned_ips.txt")
+	if n := removeTokenFromFlatFile(ipPath, tokLower); n > 0 {
+		totalRemoved += n
+		s.ipBansModTime = fileModTime(ipPath)
+	}
+	hwPath := filepath.Join(s.worldDir, "banned_hwids.txt")
+	if n := removeTokenFromFlatFile(hwPath, tokLower); n > 0 {
+		totalRemoved += n
+		s.hwBansModTime = fileModTime(hwPath)
+	}
+	return totalRemoved
+}
+
+func (s *RelayServer) addAdminKeyLocked(pubHex string) error {
+	pubHex = strings.ToLower(strings.TrimSpace(pubHex))
+	if !isValidHex64(pubHex) {
+		return errors.New("invalid 64-char hex Ed25519 public key")
+	}
+	s.firstAdminClaimed = true
+	s.adminKeys[pubHex] = true
+	_ = os.WriteFile(filepath.Join(s.worldDir, ".first_admin_claimed"), []byte(pubHex+"\n"), 0644)
+
+	tomlPath := filepath.Join(s.worldDir, "world.toml")
+	raw, err := os.ReadFile(tomlPath)
+	if err != nil {
+		return err
+	}
+	keys := make([]string, 0, len(s.adminKeys))
+	for k := range s.adminKeys {
+		if isValidHex64(k) {
+			keys = append(keys, k)
+		}
+	}
+	// Deterministic ordering
+	for i := 0; i < len(keys); i++ {
+		for j := i + 1; j < len(keys); j++ {
+			if keys[j] < keys[i] {
+				keys[i], keys[j] = keys[j], keys[i]
+			}
+		}
+	}
+	var quoted []string
+	for _, k := range keys {
+		quoted = append(quoted, fmt.Sprintf("%q", k))
+	}
+	adminLine := "admins = [" + strings.Join(quoted, ", ") + "]"
+
+	lines := strings.Split(strings.ReplaceAll(string(raw), "\r\n", "\n"), "\n")
+	replaced := false
+	inRules := false
+	rulesEndIdx := -1
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") && !strings.HasPrefix(trimmed, "[[") {
+			if inRules && rulesEndIdx == -1 {
+				rulesEndIdx = i
+			}
+			inRules = (trimmed == "[rules]")
+			continue
+		}
+		if inRules && strings.HasPrefix(trimmed, "admins") {
+			rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "admins"))
+			if strings.HasPrefix(rest, "=") {
+				lines[i] = adminLine
+				replaced = true
+				break
+			}
+		}
+	}
+	if !replaced {
+		if rulesEndIdx > 0 {
+			newLines := make([]string, 0, len(lines)+1)
+			newLines = append(newLines, lines[:rulesEndIdx]...)
+			newLines = append(newLines, adminLine)
+			newLines = append(newLines, lines[rulesEndIdx:]...)
+			lines = newLines
+		} else if inRules {
+			lines = append(lines, adminLine)
+		} else {
+			lines = append(lines, "", "[rules]", adminLine)
+		}
+	}
+	tmpPath := tomlPath + ".tmp"
+	if err := os.WriteFile(tmpPath, []byte(strings.Join(lines, "\n")), 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, tomlPath); err != nil {
+		return err
+	}
+	s.tomlModTime = fileModTime(tomlPath)
+	return nil
 }
 
 func (s *RelayServer) clientIP(r *http.Request) string {
@@ -1551,21 +2199,42 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pubLower := strings.ToLower(auth.PubKey)
+	hwLower := strings.ToLower(strings.TrimSpace(auth.HWID))
 	avLower := strings.ToLower(auth.AvatarHash)
 
 	s.mu.RLock()
-	banned := s.bannedKeys[pubLower] || s.bannedKeys[auth.PubKey]
+	banned := s.bannedKeys[pubLower] || s.bannedKeys[auth.PubKey] ||
+		(s.federatedBans && s.fedBannedKeys[pubLower]) ||
+		(ip != "" && s.bannedIPs[ip]) ||
+		(isValidHex64(hwLower) && s.bannedHWIDs[hwLower])
 	blockedAvatar := avLower != "" && avLower != "none" && (s.blockedItems[avLower] || s.blockedItems[auth.AvatarHash])
 	isAdmin := s.adminKeys[pubLower]
 	s.mu.RUnlock()
 
+	autoClaimedAdmin := false
+	if !banned && !blockedAvatar && !isAdmin && isValidHex64(pubLower) {
+		s.mu.Lock()
+		if !s.firstAdminClaimed && len(s.adminKeys) == 0 && len(s.cliAdmins) == 0 {
+			s.firstAdminClaimed = true
+			s.adminKeys[pubLower] = true
+			isAdmin = true
+			autoClaimedAdmin = true
+			if err := s.persistFirstAdminLocked(pubLower); err != nil {
+				log.Printf("Warning: could not persist first-start admin to world.toml: %v", err)
+			} else {
+				log.Printf("First-connect auto-admin granted to %s (%s...) and saved to world.toml", auth.Nick, pubLower[:12])
+			}
+		}
+		s.mu.Unlock()
+	}
+
 	if banned {
-		log.Printf("Blocked banned pubkey %s", auth.PubKey[:12])
+		log.Printf("Blocked banned connection pubkey=%s ip=%s hwid=%s", auth.PubKey[:12], ip, hwLower[:minIntR(12, len(hwLower))])
 		_ = conn.SetWriteDeadline(time.Now().Add(WriteWait))
 		_ = conn.WriteJSON(WireMsg{
 			Type:    "ERROR",
 			Code:    "ERR_BANNED",
-			Message: "public key is banned on this relay",
+			Message: "you are banned on this relay",
 		})
 		return
 	}
@@ -1584,6 +2253,8 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 		auth.AvatarHash = "none"
 	}
 	cc.pubKey = auth.PubKey
+	cc.hwID = hwLower
+	cc.ip = ip
 	cc.avatarHash = auth.AvatarHash
 	cc.nick = sanitizeNick(auth.Nick, auth.PubKey)
 	cc.capabilities = sanitizeCaps(auth.Capabilities)
@@ -1635,11 +2306,27 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	curSpawn := append([]float32(nil), s.worldSpawn...)
 	curMOTD := s.worldMOTD
+	curPortals := append([]WorldPortal(nil), s.worldPortals...)
+	curRadioURL := s.radioURL
+	curRadioTitle := s.radioTitle
 	s.mu.RUnlock()
 	if finiteVec3(curSpawn) {
 		cc.enqueueJSON(WireMsg{
 			Type: "SPAWN_UPDATE",
 			Pos:  curSpawn,
+		}, false)
+	}
+	if len(curPortals) > 0 {
+		cc.enqueueJSON(WireMsg{
+			Type:    "PORTALS_UPDATE",
+			Portals: curPortals,
+		}, false)
+	}
+	if curRadioURL != "" {
+		cc.enqueueJSON(WireMsg{
+			Type: "RADIO_UPDATE",
+			Data: curRadioURL,
+			Text: curRadioTitle,
 		}, false)
 	}
 	if curMOTD != "" {
@@ -1653,11 +2340,15 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if isAdmin {
+		welcomeAdminTxt := "Admin authenticated (/setspawn, /addportal, /delportal, /clearportals, /setradio, /clearradio, /whois, /addadmin, /unban, /kick, /ban, /clearprops)"
+		if autoClaimedAdmin {
+			welcomeAdminTxt = "First-start admin claimed automatically and saved to world.toml! " + welcomeAdminTxt
+		}
 		cc.enqueueJSON(WireMsg{
 			Type:      "CHAT",
 			Nick:      "RELAY",
 			Channel:   "whisper",
-			Text:      "Admin authenticated (/setspawn [x y z], /kick, /ban, /clearprops)",
+			Text:      welcomeAdminTxt,
 			Timestamp: time.Now().Unix(),
 		}, false)
 	}
@@ -1949,8 +2640,23 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			// Handle admin slash commands (/setspawn, /kick, /ban, /clearprops) if sender is in admins list
+			if txt == "/whois" || strings.HasPrefix(txt, "/whois ") ||
+				txt == "/playerinfo" || strings.HasPrefix(txt, "/playerinfo ") {
+				s.handleAdminWhois(cc, txt)
+				continue
+			}
+
+			// Handle admin slash commands if sender is in admins list
 			if txt == "/setspawn" || strings.HasPrefix(txt, "/setspawn ") ||
+				strings.HasPrefix(txt, "/addportal ") || txt == "/addportal" ||
+				strings.HasPrefix(txt, "/delportal ") || txt == "/delportal" ||
+				txt == "/clearportals" ||
+				strings.HasPrefix(txt, "/setradio ") || txt == "/setradio" ||
+				txt == "/clearradio" ||
+				strings.HasPrefix(txt, "/banfeed ") || txt == "/banfeed" || txt == "/banfeeds" ||
+				strings.HasPrefix(txt, "/federatedbans ") || txt == "/federatedbans" ||
+				strings.HasPrefix(txt, "/unban ") || txt == "/unban" ||
+				strings.HasPrefix(txt, "/addadmin ") || txt == "/addadmin" ||
 				strings.HasPrefix(txt, "/kick ") || strings.HasPrefix(txt, "/ban ") || txt == "/clearprops" {
 				s.handleAdminCommand(cc, txt)
 				continue
@@ -2057,6 +2763,469 @@ func (s *RelayServer) handleAdminCommand(cc *ClientConn, cmd string) {
 		return
 	}
 
+	if cmd == "/addportal" || strings.HasPrefix(cmd, "/addportal ") {
+		rawArgs := strings.TrimSpace(strings.TrimPrefix(cmd, "/addportal"))
+		fields := strings.Fields(rawArgs)
+		if len(fields) == 0 {
+			s.sendError(cc, "ERR_INVALID_PORTAL", "usage: /addportal <url> [name...] or /addportal <name> <url>")
+			return
+		}
+		var portalURL, portalName string
+		looksLikeURL := func(v string) bool {
+			return strings.Contains(v, "://") || strings.HasPrefix(v, "127.") ||
+				strings.HasPrefix(v, "localhost") || strings.Contains(v, ".")
+		}
+		if looksLikeURL(fields[0]) {
+			portalURL = fields[0]
+			if len(fields) > 1 {
+				portalName = strings.Join(fields[1:], " ")
+			}
+		} else if len(fields) >= 2 && looksLikeURL(fields[1]) {
+			portalName = fields[0]
+			portalURL = fields[1]
+			if len(fields) > 2 {
+				portalName += " " + strings.Join(fields[2:], " ")
+			}
+		} else {
+			s.sendError(cc, "ERR_INVALID_PORTAL", "usage: /addportal <url> [name...]")
+			return
+		}
+		if !strings.Contains(portalURL, "://") {
+			portalURL = "vektorweb://" + portalURL
+		}
+		if strings.HasPrefix(strings.ToLower(portalURL), "http://") || strings.HasPrefix(strings.ToLower(portalURL), "https://") || strings.HasPrefix(strings.ToLower(portalURL), "vektorweb://") {
+			noScheme := portalURL
+			if idx := strings.Index(noScheme, "://"); idx != -1 {
+				scheme := noScheme[:idx+3]
+				rest := noScheme[idx+3:]
+				if !strings.Contains(rest, "/") {
+					portalURL = scheme + rest + "/world.toml"
+				} else if strings.HasSuffix(rest, "/") {
+					portalURL = scheme + strings.TrimRight(rest, "/") + "/world.toml"
+				}
+			}
+		}
+		lowerU := strings.ToLower(portalURL)
+		if !strings.HasPrefix(lowerU, "http://") && !strings.HasPrefix(lowerU, "https://") &&
+			!strings.HasPrefix(lowerU, "vektorweb://") && lowerU != "local://sandbox" {
+			s.sendError(cc, "ERR_INVALID_PORTAL", "portal URL must use http://, https://, vektorweb://, or local://sandbox")
+			return
+		}
+		portalName = sanitizeControlChars(portalName, 40)
+		if portalName == "" {
+			portalName = sanitizeControlChars(portalURL, 40)
+		}
+
+		s.mu.Lock()
+		if !cc.hasState {
+			s.mu.Unlock()
+			s.sendError(cc, "ERR_NO_POS", "move slightly first so relay knows your coordinates")
+			return
+		}
+		floorY := cc.pos[1] - 1.65
+		if math.Abs(float64(floorY)) < 0.25 {
+			floorY = 0.0
+		}
+		newPortal := WorldPortal{
+			Name:   portalName,
+			URL:    portalURL,
+			Pos:    []float32{cc.pos[0], floorY, cc.pos[2]},
+			Radius: 1.75,
+		}
+		updated := append([]WorldPortal(nil), s.worldPortals...)
+		updated = append(updated, newPortal)
+		err := s.updateWorldPortalsLocked(updated)
+		s.mu.Unlock()
+		if err != nil {
+			s.sendError(cc, "ERR_PORTAL_SAVE", "failed saving portal to world.toml: "+err.Error())
+			return
+		}
+
+		s.broadcast("", WireMsg{Type: "PORTALS_UPDATE", Portals: updated}, false)
+		cc.enqueueJSON(WireMsg{
+			Type:      "CHAT",
+			PubKey:    cc.pubKey,
+			Nick:      "RELAY",
+			Channel:   "whisper",
+			Text:      fmt.Sprintf("Added portal %q -> %s at [%.1f, %.1f, %.1f].", portalName, portalURL, newPortal.Pos[0], newPortal.Pos[1], newPortal.Pos[2]),
+			Timestamp: time.Now().Unix(),
+		}, false)
+		return
+	}
+
+	if cmd == "/delportal" || strings.HasPrefix(cmd, "/delportal ") {
+		q := strings.TrimSpace(strings.TrimPrefix(cmd, "/delportal"))
+		if q == "" {
+			s.sendError(cc, "ERR_INVALID_PORTAL", "usage: /delportal <name-or-number>")
+			return
+		}
+		s.mu.Lock()
+		if len(s.worldPortals) == 0 {
+			s.mu.Unlock()
+			s.sendError(cc, "ERR_NOT_FOUND", "no portals exist in this world")
+			return
+		}
+		var kept []WorldPortal
+		var removedName string
+		idxNum := -1
+		if n, err := fmt.Sscanf(q, "%d", &idxNum); n == 1 && err == nil && idxNum >= 1 && idxNum <= len(s.worldPortals) {
+			for i, p := range s.worldPortals {
+				if i == idxNum-1 {
+					removedName = p.Name
+					continue
+				}
+				kept = append(kept, p)
+			}
+		} else {
+			qLower := strings.ToLower(q)
+			for _, p := range s.worldPortals {
+				if removedName == "" && (strings.Contains(strings.ToLower(p.Name), qLower) || strings.Contains(strings.ToLower(p.URL), qLower)) {
+					removedName = p.Name
+					continue
+				}
+				kept = append(kept, p)
+			}
+		}
+		if removedName == "" {
+			s.mu.Unlock()
+			s.sendError(cc, "ERR_NOT_FOUND", "no portal matching "+q)
+			return
+		}
+		err := s.updateWorldPortalsLocked(kept)
+		s.mu.Unlock()
+		if err != nil {
+			s.sendError(cc, "ERR_PORTAL_SAVE", "failed updating world.toml: "+err.Error())
+			return
+		}
+		s.broadcast("", WireMsg{Type: "PORTALS_UPDATE", Portals: kept}, false)
+		cc.enqueueJSON(WireMsg{
+			Type:      "CHAT",
+			PubKey:    cc.pubKey,
+			Nick:      "RELAY",
+			Channel:   "whisper",
+			Text:      fmt.Sprintf("Removed portal %q.", removedName),
+			Timestamp: time.Now().Unix(),
+		}, false)
+		return
+	}
+
+	if cmd == "/clearportals" {
+		s.mu.Lock()
+		count := len(s.worldPortals)
+		err := s.updateWorldPortalsLocked(nil)
+		s.mu.Unlock()
+		if err != nil {
+			s.sendError(cc, "ERR_PORTAL_SAVE", "failed updating world.toml: "+err.Error())
+			return
+		}
+		s.broadcast("", WireMsg{Type: "PORTALS_UPDATE", Portals: nil}, false)
+		cc.enqueueJSON(WireMsg{
+			Type:      "CHAT",
+			PubKey:    cc.pubKey,
+			Nick:      "RELAY",
+			Channel:   "whisper",
+			Text:      fmt.Sprintf("Cleared %d portal(s) from world.toml.", count),
+			Timestamp: time.Now().Unix(),
+		}, false)
+		return
+	}
+
+	if cmd == "/setradio" || strings.HasPrefix(cmd, "/setradio ") || cmd == "/clearradio" {
+		var streamURL, title string
+		if cmd != "/clearradio" {
+			rawArgs := strings.TrimSpace(strings.TrimPrefix(cmd, "/setradio"))
+			fields := strings.Fields(rawArgs)
+			if len(fields) == 0 {
+				s.sendError(cc, "ERR_INVALID_RADIO", "usage: /setradio <http(s)-stream-url> [title...] or /clearradio")
+				return
+			}
+			if !strings.EqualFold(fields[0], "off") && !strings.EqualFold(fields[0], "none") {
+				streamURL = fields[0]
+				lowerU := strings.ToLower(streamURL)
+				if !strings.HasPrefix(lowerU, "http://") && !strings.HasPrefix(lowerU, "https://") {
+					s.sendError(cc, "ERR_INVALID_RADIO", "radio stream_url must start with http:// or https://")
+					return
+				}
+				if len(fields) > 1 {
+					title = sanitizeControlChars(strings.Join(fields[1:], " "), 48)
+				}
+			}
+		}
+
+		s.mu.Lock()
+		err := s.updateWorldAudioLocked(streamURL, title)
+		s.mu.Unlock()
+		if err != nil {
+			s.sendError(cc, "ERR_RADIO_SAVE", "failed saving [audio] to world.toml: "+err.Error())
+			return
+		}
+
+		s.broadcast("", WireMsg{Type: "RADIO_UPDATE", Data: streamURL, Text: title}, false)
+		statusTxt := "Cleared world radio stream in world.toml."
+		if streamURL != "" {
+			statusTxt = fmt.Sprintf("Set world radio to %s (%s) in world.toml.", streamURL, title)
+		}
+		cc.enqueueJSON(WireMsg{
+			Type:      "CHAT",
+			PubKey:    cc.pubKey,
+			Nick:      "RELAY",
+			Channel:   "whisper",
+			Text:      statusTxt,
+			Timestamp: time.Now().Unix(),
+		}, false)
+		return
+	}
+
+	if cmd == "/banfeeds" || cmd == "/banfeed" || strings.HasPrefix(cmd, "/banfeed ") ||
+		cmd == "/federatedbans" || strings.HasPrefix(cmd, "/federatedbans ") {
+		if cmd == "/banfeeds" {
+			s.mu.RLock()
+			en := s.federatedBans
+			feeds := append([]string(nil), s.banFeeds...)
+			fedCount := len(s.fedBannedKeys)
+			s.mu.RUnlock()
+			cc.enqueueJSON(WireMsg{
+				Type:      "CHAT",
+				PubKey:    cc.pubKey,
+				Nick:      "RELAY",
+				Channel:   "whisper",
+				Text:      fmt.Sprintf("Federated bans: %v | feeds=%d | active_fed_keys=%d", en, len(feeds), fedCount),
+				Timestamp: time.Now().Unix(),
+			}, false)
+			for i, f := range feeds {
+				cc.enqueueJSON(WireMsg{
+					Type:      "CHAT",
+					PubKey:    cc.pubKey,
+					Nick:      "RELAY",
+					Channel:   "whisper",
+					Text:      fmt.Sprintf("  [%d] %s", i+1, f),
+					Timestamp: time.Now().Unix(),
+				}, false)
+			}
+			return
+		}
+		if cmd == "/federatedbans" || strings.HasPrefix(cmd, "/federatedbans ") {
+			arg := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(cmd, "/federatedbans")))
+			var want bool
+			switch arg {
+			case "on", "true", "1", "optin", "opt-in":
+				want = true
+			case "off", "false", "0", "optout", "opt-out":
+				want = false
+			default:
+				s.sendError(cc, "ERR_INVALID_ARG", "usage: /federatedbans on|off")
+				return
+			}
+			s.mu.Lock()
+			s.federatedBans = want
+			if !want {
+				s.fedBannedKeys = make(map[string]bool)
+			}
+			s.mu.Unlock()
+			if want {
+				go s.syncFederatedBanFeeds(true)
+			}
+			cc.enqueueJSON(WireMsg{
+				Type:      "CHAT",
+				PubKey:    cc.pubKey,
+				Nick:      "RELAY",
+				Channel:   "whisper",
+				Text:      fmt.Sprintf("Federated bans set to %v.", want),
+				Timestamp: time.Now().Unix(),
+			}, false)
+			return
+		}
+		parts := strings.Fields(strings.TrimPrefix(cmd, "/banfeed"))
+		if len(parts) < 2 {
+			s.sendError(cc, "ERR_INVALID_ARG", "usage: /banfeed add <url> | del <url|#> | optin | optout")
+			return
+		}
+		sub := strings.ToLower(parts[0])
+		if sub == "optin" || sub == "opt-in" || sub == "optout" || sub == "opt-out" {
+			want := (sub == "optin" || sub == "opt-in")
+			s.mu.Lock()
+			s.federatedBans = want
+			if !want {
+				s.fedBannedKeys = make(map[string]bool)
+			}
+			s.mu.Unlock()
+			if want {
+				go s.syncFederatedBanFeeds(true)
+			}
+			cc.enqueueJSON(WireMsg{
+				Type:      "CHAT",
+				PubKey:    cc.pubKey,
+				Nick:      "RELAY",
+				Channel:   "whisper",
+				Text:      fmt.Sprintf("Federated bans set to %v.", want),
+				Timestamp: time.Now().Unix(),
+			}, false)
+			return
+		}
+		if sub == "add" {
+			u := strings.TrimSpace(parts[1])
+			if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+				s.sendError(cc, "ERR_INVALID_ARG", "banfeed URL must start with http:// or https://")
+				return
+			}
+			s.mu.Lock()
+			exists := false
+			for _, existing := range s.banFeeds {
+				if strings.EqualFold(existing, u) {
+					exists = true
+					break
+				}
+			}
+			if !exists {
+				s.banFeeds = append(s.banFeeds, u)
+			}
+			s.mu.Unlock()
+			go s.syncFederatedBanFeeds(true)
+			cc.enqueueJSON(WireMsg{
+				Type:      "CHAT",
+				PubKey:    cc.pubKey,
+				Nick:      "RELAY",
+				Channel:   "whisper",
+				Text:      fmt.Sprintf("Subscribed to federated ban feed %s", u),
+				Timestamp: time.Now().Unix(),
+			}, false)
+			return
+		}
+		if sub == "del" {
+			q := strings.TrimSpace(parts[1])
+			s.mu.Lock()
+			var kept []string
+			removed := ""
+			idxNum := -1
+			if n, err := fmt.Sscanf(q, "%d", &idxNum); n == 1 && err == nil && idxNum >= 1 && idxNum <= len(s.banFeeds) {
+				for i, f := range s.banFeeds {
+					if i == idxNum-1 {
+						removed = f
+						continue
+					}
+					kept = append(kept, f)
+				}
+			} else {
+				for _, f := range s.banFeeds {
+					if removed == "" && strings.Contains(strings.ToLower(f), strings.ToLower(q)) {
+						removed = f
+						continue
+					}
+					kept = append(kept, f)
+				}
+			}
+			if removed != "" {
+				s.banFeeds = kept
+			}
+			s.mu.Unlock()
+			if removed == "" {
+				s.sendError(cc, "ERR_NOT_FOUND", "no ban feed matching "+q)
+				return
+			}
+			go s.syncFederatedBanFeeds(true)
+			cc.enqueueJSON(WireMsg{
+				Type:      "CHAT",
+				PubKey:    cc.pubKey,
+				Nick:      "RELAY",
+				Channel:   "whisper",
+				Text:      fmt.Sprintf("Unsubscribed from ban feed %s", removed),
+				Timestamp: time.Now().Unix(),
+			}, false)
+			return
+		}
+		s.sendError(cc, "ERR_INVALID_ARG", "usage: /banfeed add <url> | del <url|#> | optin | optout")
+		return
+	}
+
+	if cmd == "/unban" || strings.HasPrefix(cmd, "/unban ") {
+		tok := strings.TrimSpace(strings.TrimPrefix(cmd, "/unban"))
+		if tok == "" {
+			s.sendError(cc, "ERR_INVALID_ARG", "usage: /unban <64-char-pubkey | ip | hwid>")
+			return
+		}
+		s.mu.Lock()
+		removed := s.removeBanTokenLocked(tok)
+		s.mu.Unlock()
+		if removed == 0 {
+			s.sendError(cc, "ERR_NOT_FOUND", "no matching ban entry found for "+tok)
+			return
+		}
+		cc.enqueueJSON(WireMsg{
+			Type:      "CHAT",
+			PubKey:    cc.pubKey,
+			Nick:      "RELAY",
+			Channel:   "whisper",
+			Text:      fmt.Sprintf("Unbanned %q (%d entry/entries removed).", tok, removed),
+			Timestamp: time.Now().Unix(),
+		}, false)
+		return
+	}
+
+	if cmd == "/addadmin" || strings.HasPrefix(cmd, "/addadmin ") {
+		q := strings.TrimSpace(strings.TrimPrefix(cmd, "/addadmin"))
+		if q == "" {
+			s.sendError(cc, "ERR_INVALID_ARG", "usage: /addadmin <nick | 64-char-pubkey>")
+			return
+		}
+		qLower := strings.ToLower(q)
+		s.mu.Lock()
+		var targetConn *ClientConn
+		targetPub := ""
+		if isValidHex64(qLower) {
+			targetPub = qLower
+			for pub, peer := range s.clients {
+				if strings.EqualFold(pub, qLower) {
+					targetConn = peer
+					break
+				}
+			}
+		} else {
+			for pub, peer := range s.clients {
+				shortPub := strings.ToLower(pub)
+				if len(shortPub) > 6 {
+					shortPub = shortPub[:6]
+				}
+				peerTag := strings.ToLower(peer.nick) + "#" + shortPub
+				if strings.HasPrefix(strings.ToLower(pub), qLower) || strings.EqualFold(peer.nick, q) || peerTag == qLower {
+					targetConn = peer
+					targetPub = strings.ToLower(pub)
+					break
+				}
+			}
+		}
+		if !isValidHex64(targetPub) {
+			s.mu.Unlock()
+			s.sendError(cc, "ERR_NOT_FOUND", "no matching online player or valid 64-char pubkey for "+q)
+			return
+		}
+		err := s.addAdminKeyLocked(targetPub)
+		s.mu.Unlock()
+		if err != nil {
+			s.sendError(cc, "ERR_ADMIN_SAVE", "failed saving admin to world.toml: "+err.Error())
+			return
+		}
+		label := targetPub[:12] + "..."
+		if targetConn != nil {
+			label = fmt.Sprintf("%s (%s...)", targetConn.nick, targetPub[:12])
+			targetConn.enqueueJSON(WireMsg{
+				Type:      "CHAT",
+				Nick:      "RELAY",
+				Channel:   "whisper",
+				Text:      "You were promoted to world admin by " + cc.nick + "!",
+				Timestamp: time.Now().Unix(),
+			}, false)
+		}
+		cc.enqueueJSON(WireMsg{
+			Type:      "CHAT",
+			PubKey:    cc.pubKey,
+			Nick:      "RELAY",
+			Channel:   "whisper",
+			Text:      "Promoted " + label + " to world admin in world.toml.",
+			Timestamp: time.Now().Unix(),
+		}, false)
+		return
+	}
+
 	if cmd == "/clearprops" {
 		s.mu.Lock()
 		ids := make([]string, 0, len(s.props))
@@ -2107,6 +3276,12 @@ func (s *RelayServer) handleAdminCommand(cc *ClientConn, cmd string) {
 	}
 	if isBan && target != nil {
 		s.appendBanKeyLocked(target.pubKey)
+		if target.ip != "" {
+			s.appendBanIPLocked(target.ip)
+		}
+		if isValidHex64(target.hwID) {
+			s.appendBanHWIDLocked(target.hwID)
+		}
 	} else if isBan && isValidHex64(qLower) {
 		s.appendBanKeyLocked(qLower)
 	}
@@ -2144,6 +3319,61 @@ func (s *RelayServer) handleAdminCommand(cc *ClientConn, cmd string) {
 	} else {
 		s.sendError(cc, "ERR_NOT_FOUND", "no matching online peer for "+query)
 	}
+}
+
+func (s *RelayServer) handleAdminWhois(cc *ClientConn, cmd string) {
+	pubLower := strings.ToLower(cc.pubKey)
+	s.mu.RLock()
+	isAdmin := s.adminKeys[pubLower]
+	s.mu.RUnlock()
+	if !isAdmin {
+		s.sendError(cc, "ERR_FORBIDDEN", "admin privileges required")
+		return
+	}
+
+	q := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(cmd, "/whois"), "/playerinfo"))
+	if q == "" {
+		s.sendError(cc, "ERR_INVALID_ARG", "usage: /whois <nick-or-pubkey-prefix>")
+		return
+	}
+	qLower := strings.ToLower(q)
+
+	s.mu.RLock()
+	var matched *ClientConn
+	for pub, peer := range s.clients {
+		shortPub := strings.ToLower(pub)
+		if len(shortPub) > 6 {
+			shortPub = shortPub[:6]
+		}
+		peerTag := strings.ToLower(peer.nick) + "#" + shortPub
+		if strings.HasPrefix(strings.ToLower(pub), qLower) || strings.EqualFold(peer.nick, q) || peerTag == qLower {
+			matched = peer
+			break
+		}
+	}
+	var info string
+	if matched != nil {
+		hwDisp := matched.hwID
+		if hwDisp == "" {
+			hwDisp = "(none)"
+		}
+		info = fmt.Sprintf("Player %s | pubkey=%s | ip=%s | hwid=%s | pos=[%.1f, %.1f, %.1f]",
+			matched.nick, matched.pubKey, matched.ip, hwDisp, matched.pos[0], matched.pos[1], matched.pos[2])
+	}
+	s.mu.RUnlock()
+
+	if matched == nil {
+		s.sendError(cc, "ERR_NOT_FOUND", "no matching online peer for "+q)
+		return
+	}
+	cc.enqueueJSON(WireMsg{
+		Type:      "CHAT",
+		PubKey:    cc.pubKey,
+		Nick:      "RELAY",
+		Channel:   "whisper",
+		Text:      info,
+		Timestamp: time.Now().Unix(),
+	}, false)
 }
 
 func sanitizeControlChars(raw string, maxLen int) string {

@@ -205,6 +205,7 @@ type WireMsg struct {
 	Nonce        string    `json:"nonce,omitempty"`
 	Timestamp    int64     `json:"timestamp,omitempty"`
 	PubKey       string    `json:"pubkey,omitempty"`
+	HWID         string    `json:"hwid,omitempty"`
 	TargetPub    string    `json:"target_pub,omitempty"`
 	Signature    string    `json:"signature,omitempty"`
 	AvatarHash   string    `json:"avatar_hash,omitempty"`
@@ -220,10 +221,11 @@ type WireMsg struct {
 	Text         string    `json:"text,omitempty"`
 	Channel      string    `json:"channel,omitempty"`
 	PropID       string    `json:"prop_id,omitempty"`
-	Scale        float32   `json:"scale,omitempty"`
-	AnimClip     int       `json:"anim_clip,omitempty"`
-	Code         string    `json:"code,omitempty"`
-	Message      string    `json:"message,omitempty"`
+	Scale        float32       `json:"scale,omitempty"`
+	AnimClip     int           `json:"anim_clip,omitempty"`
+	Portals      []WorldPortal `json:"portals,omitempty"`
+	Code         string        `json:"code,omitempty"`
+	Message      string        `json:"message,omitempty"`
 }
 
 type TransferWhisperPayload struct {
@@ -532,6 +534,11 @@ type NetState struct {
 	connected        bool
 	relayHost        string
 	liveSpawn        []float32
+	livePortals      []WorldPortal
+	portalsUpdated   bool
+	liveRadioURL     string
+	liveRadioTitle   string
+	radioUpdated     bool
 	peers            map[string]*RemotePeer
 	props            map[string]*WorldProp
 	requested        map[string]bool
@@ -633,6 +640,11 @@ func (n *NetState) resetSessionForPortal() {
 	n.conn = nil
 	n.connected = false
 	n.liveSpawn = nil
+	n.livePortals = nil
+	n.portalsUpdated = false
+	n.liveRadioURL = ""
+	n.liveRadioTitle = ""
+	n.radioUpdated = false
 	n.peers = make(map[string]*RemotePeer)
 	n.props = make(map[string]*WorldProp)
 	n.requested = make(map[string]bool)
@@ -680,6 +692,24 @@ func sanitizeDisplayText(s string, maxLen int) string {
 		}
 	}
 	return b.String()
+}
+
+func computeLocalHWID(fallbackSeed string) string {
+	var parts []string
+	parts = append(parts, runtime.GOOS, runtime.GOARCH)
+	if hn, err := os.Hostname(); err == nil && strings.TrimSpace(hn) != "" {
+		parts = append(parts, strings.TrimSpace(hn))
+	}
+	for _, midPath := range []string{"/etc/machine-id", "/var/db/hostid"} {
+		if b, err := os.ReadFile(midPath); err == nil && len(strings.TrimSpace(string(b))) > 0 {
+			parts = append(parts, strings.TrimSpace(string(b)))
+			break
+		}
+	}
+	if len(parts) <= 2 {
+		parts = append(parts, fallbackSeed)
+	}
+	return identity.FileSHA256([]byte(strings.Join(parts, "|")))
 }
 
 func isValidHex64(s string) bool {
@@ -738,9 +768,22 @@ func normalizeWorldURL(raw string) string {
 		hostPart := strings.Split(rest, "/")[0]
 		if strings.HasPrefix(rest, "127.0.0.1") || strings.HasPrefix(rest, "localhost") ||
 			strings.HasPrefix(rest, "[::1]") || strings.Contains(hostPart, ":") {
-			return "http://" + rest
+			trimmed = "http://" + rest
+		} else {
+			trimmed = "https://" + rest
 		}
-		return "https://" + rest
+	}
+	if strings.HasPrefix(trimmed, "http://") || strings.HasPrefix(trimmed, "https://") {
+		if u, err := url.Parse(trimmed); err == nil && u.Host != "" {
+			p := strings.TrimSpace(u.Path)
+			if p == "" || p == "/" {
+				u.Path = "/world.toml"
+				trimmed = u.String()
+			} else if !strings.HasSuffix(strings.ToLower(p), ".toml") && !strings.Contains(filepath.Base(p), ".") {
+				u.Path = strings.TrimRight(p, "/") + "/world.toml"
+				trimmed = u.String()
+			}
+		}
 	}
 	return trimmed
 }
@@ -2040,6 +2083,7 @@ func main() {
 		targetURL = normalizeWorldURL(targetURL)
 		prevURL := activeWorld.URL
 		netState.addChat("[PORTAL]: Loading " + targetURL + " ...")
+		lastPortalHop = time.Now()
 		nextW, err := loadWorldFromURL(targetURL, cacheDir)
 		if err != nil {
 			netState.addChat("[PORTAL ERR]: " + err.Error())
@@ -2464,10 +2508,34 @@ func main() {
 			incomingSpawn = append([]float32(nil), netState.liveSpawn...)
 			netState.liveSpawn = nil
 		}
+		hasPortalsUpdate := netState.portalsUpdated
+		var incomingPortals []WorldPortal
+		if hasPortalsUpdate {
+			incomingPortals = append([]WorldPortal(nil), netState.livePortals...)
+			netState.portalsUpdated = false
+		}
+		hasRadioUpdate := netState.radioUpdated
+		incomingRadioURL := netState.liveRadioURL
+		incomingRadioTitle := netState.liveRadioTitle
+		netState.radioUpdated = false
 		netState.mu.Unlock()
 
 		if len(incomingSpawn) == 3 {
 			spawn = safeSpawnPosition(worldModel, rl.NewVector3(incomingSpawn[0], incomingSpawn[1], incomingSpawn[2]))
+		}
+		if hasPortalsUpdate {
+			activeWorld.Manifest.Portals = incomingPortals
+			netState.addChat(fmt.Sprintf("[PORTAL]: World portals synced (%d active)", len(incomingPortals)))
+		}
+		if hasRadioUpdate {
+			activeWorld.Manifest.Audio.StreamURL = incomingRadioURL
+			activeWorld.Manifest.Audio.Title = incomingRadioTitle
+			if incomingRadioURL == "" {
+				ambientRadio.Stop()
+				netState.addChat("[RADIO]: World radio stream cleared")
+			} else {
+				startWorldAudio(activeWorld)
+			}
 		}
 
 		if needInvRescan {
@@ -2532,7 +2600,8 @@ func main() {
 			if localManualClip >= 0 && localManualClip < len(animSet.Anims) {
 				localActiveClip = localManualClip
 			} else {
-				moving := rl.IsKeyDown(rl.KeyW) || rl.IsKeyDown(rl.KeyA) || rl.IsKeyDown(rl.KeyS) || rl.IsKeyDown(rl.KeyD)
+				moving := rl.IsKeyDown(rl.KeyW) || rl.IsKeyDown(rl.KeyA) || rl.IsKeyDown(rl.KeyS) || rl.IsKeyDown(rl.KeyD) ||
+					rl.IsKeyDown(rl.KeyUp) || rl.IsKeyDown(rl.KeyDown) || rl.IsKeyDown(rl.KeyLeft) || rl.IsKeyDown(rl.KeyRight)
 				if !moving || len(animSet.Anims) == 1 {
 					localActiveClip = 0
 				} else if rl.IsKeyDown(rl.KeyLeftShift) && len(animSet.Anims) >= 3 {
@@ -3743,7 +3812,7 @@ func main() {
 						openLocalFolderOS(avatarsDir)
 						netState.addChat("[AVATAR]: Opened " + avatarsDir)
 					} else {
-						handleChatCommand(chatInput, kp, netState, hopToWorld, &visitedWorlds, &showRangeRing, &avatarInv, &propInv, &localAvHash, exportsDir, &spawn, playerHeadPos, activeWorld.URL, activeWorld.Manifest.World.Title, worldModel, &cfg, settingsPath, &directory, dirPath)
+						handleChatCommand(chatInput, kp, netState, hopToWorld, &visitedWorlds, &showRangeRing, &avatarInv, &propInv, &localAvHash, exportsDir, &spawn, playerHeadPos, activeWorld, activeWorld.URL, activeWorld.Manifest.World.Title, worldModel, &cfg, settingsPath, &directory, dirPath)
 					}
 					chatInput = ""
 				}
@@ -3769,7 +3838,7 @@ func main() {
 		}
 
 		// Check physical [[portals]] trigger volumes defined in world.toml
-		if time.Since(lastPortalHop) > 3*time.Second {
+		if time.Since(lastPortalHop) > 8*time.Second {
 			for _, portal := range activeWorld.Manifest.Portals {
 				if len(portal.Pos) != 3 || portal.URL == "" {
 					continue
@@ -3822,9 +3891,10 @@ func main() {
 		rl.DrawGrid(32, 1.0)
 		rl.DrawModel(worldModel, rl.Vector3Zero(), 1.0, rl.White)
 
-		// Render physical 3D world-space portal gates from [[portals]]
+		// Render physical 3D world-space portal gates + tall beacon markers from [[portals]]
 		pulse := float32(math.Sin(rl.GetTime()*3.0))*0.12 + 1.0
-		for _, portal := range activeWorld.Manifest.Portals {
+		bobY := float32(math.Sin(rl.GetTime()*2.4)) * 0.22
+		for idx, portal := range activeWorld.Manifest.Portals {
 			if len(portal.Pos) != 3 || portal.URL == "" {
 				continue
 			}
@@ -3833,22 +3903,71 @@ func main() {
 				rad = 1.6
 			}
 			pPos := rl.NewVector3(portal.Pos[0], portal.Pos[1], portal.Pos[2])
-			rl.DrawCircle3D(pPos, rad*pulse, rl.NewVector3(0, 1, 0), 90, rl.SkyBlue)
-			rl.DrawCylinderWires(pPos, rad, rad, 2.6, 16, rl.Fade(rl.SkyBlue, 0.55))
+			// Concentric pulsing floor rings + wireframe gate cylinder
+			rl.DrawCircle3D(rl.NewVector3(pPos.X, pPos.Y+0.03, pPos.Z), rad*pulse, rl.NewVector3(1, 0, 0), 90, rl.SkyBlue)
+			rl.DrawCircle3D(rl.NewVector3(pPos.X, pPos.Y+0.04, pPos.Z), rad*0.55, rl.NewVector3(1, 0, 0), 90, rl.Gold)
+			rl.DrawCylinderWires(pPos, rad, rad, 2.6, 16, rl.Fade(rl.SkyBlue, 0.65))
+			// Vertical beacon spire + floating diamond marker visible across the map
+			beaconTop := rl.NewVector3(pPos.X, pPos.Y+5.4+bobY, pPos.Z)
+			rl.DrawLine3D(rl.NewVector3(pPos.X, pPos.Y+2.6, pPos.Z), beaconTop, rl.Fade(rl.SkyBlue, 0.7))
+			rl.DrawCubeWires(beaconTop, 0.55, 0.55, 0.55, rl.Gold)
+			rl.DrawCircle3D(beaconTop, 0.58*pulse, rl.NewVector3(1, 0, 0), 90, rl.SkyBlue)
 
 			toPortal := rl.Vector3Subtract(pPos, cam.Position)
 			dist := rl.Vector3Length(toPortal)
-			if dist > 0.5 && dist < 50.0 && rl.Vector3DotProduct(lookVec, toPortal) > 0 {
-				labelName := portal.Name
-				if labelName == "" {
-					labelName = portal.URL
+			labelName := portal.Name
+			if labelName == "" {
+				labelName = portal.URL
+			}
+			cleanPortalName := sanitizeDisplayText(labelName, 26)
+			if dist > 0.5 && dist < 95.0 {
+				inFront := rl.Vector3DotProduct(lookVec, toPortal) > 0
+				sp := rl.GetWorldToScreen(rl.NewVector3(pPos.X, pPos.Y+3.15, pPos.Z), cam)
+				onScreen := inFront && sp.X >= 40 && sp.X <= float32(sw-40) && sp.Y >= 40 && sp.Y <= float32(sh-40)
+				if onScreen {
+					screenLabels = append(screenLabels, screenLabel{
+						screenPos: sp,
+						label:     fmt.Sprintf("PORTAL #%d: %s (%.1fm)", idx+1, cleanPortalName, dist),
+						isPortal:  true,
+					})
+				} else {
+					// Clamp directional edge indicator so off-screen portals remain easy to locate
+					camRight := rl.Vector3Normalize(rl.Vector3CrossProduct(lookVec, cam.Up))
+					dx := rl.Vector3DotProduct(toPortal, camRight)
+					dy := -toPortal.Y
+					if !inFront && math.Abs(float64(dx)) < 0.25 {
+						if dx >= 0 {
+							dx = 1.0
+						} else {
+							dx = -1.0
+						}
+					}
+					edgeX := float32(sw)*0.5 + dx*float32(sw)*0.45
+					edgeY := float32(sh)*0.5 + dy*float32(sh)*0.25
+					if edgeX < 135 {
+						edgeX = 135
+					} else if edgeX > float32(sw-135) {
+						edgeX = float32(sw - 135)
+					}
+					if edgeY < 95 {
+						edgeY = 95
+					} else if edgeY > float32(sh-95) {
+						edgeY = float32(sh - 95)
+					}
+					arrow := "^"
+					if edgeX <= 140 {
+						arrow = "<"
+					} else if edgeX >= float32(sw-140) {
+						arrow = ">"
+					} else if !inFront {
+						arrow = "v"
+					}
+					screenLabels = append(screenLabels, screenLabel{
+						screenPos: rl.NewVector2(edgeX, edgeY),
+						label:     fmt.Sprintf("%s PORTAL: %s (%.0fm)", arrow, cleanPortalName, dist),
+						isPortal:  true,
+					})
 				}
-				sp := rl.GetWorldToScreen(rl.NewVector3(pPos.X, pPos.Y+2.9, pPos.Z), cam)
-				screenLabels = append(screenLabels, screenLabel{
-					screenPos: sp,
-					label:     fmt.Sprintf("PORTAL: %s (%.1fm)", sanitizeDisplayText(labelName, 28), dist),
-					isPortal:  true,
-				})
 			}
 		}
 
@@ -3862,18 +3981,26 @@ func main() {
 		}
 
 		if thirdPerson && walkMode {
-			feetPos := rl.NewVector3(bodyHeadPos.X, bodyHeadPos.Y-1.65, bodyHeadPos.Z)
+			isMovingNow := rl.IsKeyDown(rl.KeyW) || rl.IsKeyDown(rl.KeyA) || rl.IsKeyDown(rl.KeyS) || rl.IsKeyDown(rl.KeyD) ||
+				rl.IsKeyDown(rl.KeyUp) || rl.IsKeyDown(rl.KeyDown) || rl.IsKeyDown(rl.KeyLeft) || rl.IsKeyDown(rl.KeyRight)
+			strideBob := float32(0)
+			strideRoll := float32(0)
+			if isMovingNow && (loadedAnims[localAvHash] == nil || len(loadedAnims[localAvHash].Anims) == 0) {
+				strideBob = float32(math.Abs(math.Sin(rl.GetTime()*10.0))) * 0.06
+				strideRoll = float32(math.Sin(rl.GetTime()*10.0)) * 3.5
+			}
+			feetPos := rl.NewVector3(bodyHeadPos.X, bodyHeadPos.Y-1.65+strideBob, bodyHeadPos.Z)
 			userAvSc := cfg.AvatarScale
 			if userAvSc <= 0 {
 				userAvSc = 1.0
 			}
-			rl.DrawCircle3D(rl.NewVector3(feetPos.X, feetPos.Y+0.02, feetPos.Z), 0.42*userAvSc, rl.NewVector3(1, 0, 0), 90, rl.Fade(rl.SkyBlue, 0.7))
+			rl.DrawCircle3D(rl.NewVector3(feetPos.X, feetPos.Y-strideBob+0.02, feetPos.Z), 0.42*userAvSc, rl.NewVector3(1, 0, 0), 90, rl.Fade(rl.SkyBlue, 0.7))
 			if mod, ok := loadedModels[localAvHash]; ok {
 				met := getAvatarMetrics(modelMetrics, localAvHash, mod)
 				poseModelAnimClip(mod, loadedAnims[localAvHash], localActiveClip, 0)
 				avSc := met.BaseScale * userAvSc
 				drawPos := rl.NewVector3(feetPos.X, feetPos.Y+met.FeetOffsetY*avSc, feetPos.Z)
-				rl.DrawModelEx(mod, drawPos, rl.NewVector3(0, 1, 0), bodyYaw, rl.NewVector3(avSc, avSc, avSc), rl.White)
+				drawModelEuler(mod, drawPos, bodyYaw, 0, strideRoll, avSc, rl.White)
 			} else {
 				rl.DrawCapsule(
 					rl.NewVector3(feetPos.X, feetPos.Y+0.35, feetPos.Z),
@@ -5049,6 +5176,7 @@ func handleChatCommand(
 	exportsDir string,
 	spawn *rl.Vector3,
 	curPos rl.Vector3,
+	activeWorld *LoadedWorld,
 	activeWorldURL string,
 	activeWorldTitle string,
 	worldModel rl.Model,
@@ -5059,7 +5187,8 @@ func handleChatCommand(
 ) {
 	input = strings.TrimSpace(input)
 	if input == "/help" || input == "/?" || strings.HasPrefix(input, "/help ") {
-		ns.addChat("[HELP]: Commands: /help, /debug, /uploadavatar, /openavatars, /clear, /range, /back, /history, /clearmyprops, /exportworld, /me <act>, /outfit, /nick, /say, /w, /portal, /bookmark, /setspawn, /copykey")
+		ns.addChat("[HELP]: Commands: /help, /debug, /uploadavatar, /openavatars, /clear, /range, /back, /history, /portals, /clearmyprops, /exportworld, /me <act>, /outfit, /nick, /say, /w, /portal, /bookmark, /copykey")
+		ns.addChat("[HELP ADMIN]: /setspawn, /addportal, /delportal, /clearportals, /setradio, /clearradio, /banfeeds, /federatedbans, /whois, /addadmin, /unban, /kick, /ban, /clearprops")
 		ns.addChat("[HELP]: Keys: [F1] Full Help | [I] Inventory | [G]/[Esc] Build | [C] 3P | [F] Walk/Fly | [H] Waypoint | [0-9] Anim Clip | [R] Spawn | [V] Voice")
 		return
 	}
@@ -5181,6 +5310,37 @@ func handleChatCommand(
 		}
 		return
 	}
+	if input == "/portals" {
+		if activeWorld == nil || activeWorld.Manifest == nil || len(activeWorld.Manifest.Portals) == 0 {
+			ns.addChat("[PORTAL]: No portals defined in this world. Admins can use /addportal <url> [name].")
+			return
+		}
+		for i, p := range activeWorld.Manifest.Portals {
+			if len(p.Pos) == 3 {
+				ns.addChat(fmt.Sprintf("[PORTAL #%d]: %s -> %s at [%.1f, %.1f, %.1f]", i+1, p.Name, p.URL, p.Pos[0], p.Pos[1], p.Pos[2]))
+			}
+		}
+		return
+	}
+	if input == "/addportal" || strings.HasPrefix(input, "/addportal ") ||
+		input == "/delportal" || strings.HasPrefix(input, "/delportal ") ||
+		input == "/clearportals" ||
+		input == "/setradio" || strings.HasPrefix(input, "/setradio ") ||
+		input == "/clearradio" ||
+		input == "/banfeed" || strings.HasPrefix(input, "/banfeed ") ||
+		input == "/banfeeds" ||
+		input == "/federatedbans" || strings.HasPrefix(input, "/federatedbans ") ||
+		input == "/whois" || strings.HasPrefix(input, "/whois ") ||
+		input == "/playerinfo" || strings.HasPrefix(input, "/playerinfo ") ||
+		input == "/unban" || strings.HasPrefix(input, "/unban ") ||
+		input == "/addadmin" || strings.HasPrefix(input, "/addadmin ") {
+		_ = ns.sendJSON(WireMsg{
+			Type:    "CHAT",
+			Channel: "global",
+			Text:    input,
+		})
+		return
+	}
 	if input == "/setspawn" || strings.HasPrefix(input, "/setspawn ") {
 		targetPos := curPos
 		if strings.HasPrefix(input, "/setspawn ") {
@@ -5265,6 +5425,28 @@ func handleChatCommand(
 				fmt.Fprintf(&sb, "anim_clip = %d\n", sp.animClip)
 			}
 			fmt.Fprintf(&sb, "\n")
+		}
+
+		if activeWorld != nil {
+			if strings.TrimSpace(activeWorld.Manifest.Audio.StreamURL) != "" {
+				fmt.Fprintf(&sb, "[audio]\n")
+				fmt.Fprintf(&sb, "stream_url = %q\n", activeWorld.Manifest.Audio.StreamURL)
+				fmt.Fprintf(&sb, "title = %q\n\n", activeWorld.Manifest.Audio.Title)
+			}
+			for _, pt := range activeWorld.Manifest.Portals {
+				if len(pt.Pos) != 3 || pt.URL == "" {
+					continue
+				}
+				rad := pt.Radius
+				if rad <= 0 {
+					rad = 1.6
+				}
+				fmt.Fprintf(&sb, "[[portals]]\n")
+				fmt.Fprintf(&sb, "name = %q\n", pt.Name)
+				fmt.Fprintf(&sb, "url = %q\n", pt.URL)
+				fmt.Fprintf(&sb, "pos = [%.2f, %.2f, %.2f]\n", pt.Pos[0], pt.Pos[1], pt.Pos[2])
+				fmt.Fprintf(&sb, "radius = %.2f\n\n", rad)
+			}
 		}
 
 		fname := fmt.Sprintf("world_snapshot_%s.toml", time.Now().Format("20060102_150405"))
@@ -5590,6 +5772,7 @@ func runRelaySession(ctx context.Context, conn *websocket.Conn, relayHost string
 		Nonce:        challenge.Nonce,
 		Timestamp:    challenge.Timestamp,
 		PubKey:       kp.PubHex(),
+		HWID:         computeLocalHWID(kp.PubHex()),
 		Nick:         curNick,
 		Signature:    sig,
 		AvatarHash:   curAvHash,
@@ -5675,6 +5858,35 @@ func runRelaySession(ctx context.Context, conn *websocket.Conn, relayHost string
 				ns.liveSpawn = []float32{msg.Pos[0], msg.Pos[1], msg.Pos[2]}
 				ns.mu.Unlock()
 			}
+
+		case "PORTALS_UPDATE":
+			var valid []WorldPortal
+			for _, p := range msg.Portals {
+				if p.URL == "" || !finiteVec3(p.Pos) {
+					continue
+				}
+				rad := p.Radius
+				if rad <= 0 {
+					rad = 1.6
+				}
+				valid = append(valid, WorldPortal{
+					Name:   sanitizeDisplayText(p.Name, 40),
+					URL:    strings.TrimSpace(p.URL),
+					Pos:    []float32{p.Pos[0], p.Pos[1], p.Pos[2]},
+					Radius: rad,
+				})
+			}
+			ns.mu.Lock()
+			ns.livePortals = valid
+			ns.portalsUpdated = true
+			ns.mu.Unlock()
+
+		case "RADIO_UPDATE":
+			ns.mu.Lock()
+			ns.liveRadioURL = strings.TrimSpace(msg.Data)
+			ns.liveRadioTitle = sanitizeDisplayText(msg.Text, 48)
+			ns.radioUpdated = true
+			ns.mu.Unlock()
 
 		case "ERROR":
 			ns.addChat(fmt.Sprintf("[RELAY %s]: %s", sanitizeDisplayText(msg.Code, 32), sanitizeDisplayText(msg.Message, 120)))
@@ -6100,8 +6312,13 @@ func fetchManifest(rawURL string) (*WorldManifest, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
+	rawStr := string(b)
+	trimmedBody := strings.TrimSpace(rawStr)
+	if len(trimmedBody) > 0 && trimmedBody[0] == '<' {
+		return nil, "", fmt.Errorf("expected TOML manifest at %s, got HTML instead", rawURL)
+	}
 	var m WorldManifest
-	if _, err := toml.Decode(string(b), &m); err != nil {
+	if _, err := toml.Decode(rawStr, &m); err != nil {
 		return nil, "", err
 	}
 	parsed, err := url.Parse(rawURL)
