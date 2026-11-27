@@ -58,6 +58,8 @@ type WireMsg struct {
 	Nick         string    `json:"nick,omitempty"`
 	Pos          []float32 `json:"pos,omitempty"`
 	Yaw          float32   `json:"yaw,omitempty"`
+	Pitch        float32   `json:"pitch,omitempty"`
+	Roll         float32   `json:"roll,omitempty"`
 	Hash         string    `json:"hash,omitempty"`
 	Seq          int       `json:"seq,omitempty"`
 	Total        int       `json:"total,omitempty"`
@@ -76,6 +78,8 @@ type WorldBakedProp struct {
 	Owner string    `toml:"owner"`
 	Pos   []float32 `toml:"pos"`
 	Yaw   float32   `toml:"yaw"`
+	Pitch float32   `toml:"pitch"`
+	Roll  float32   `toml:"roll"`
 	Scale float32   `toml:"scale"`
 }
 
@@ -101,6 +105,11 @@ type StatusResponse struct {
 	Online        int    `json:"online"`
 	Props         int    `json:"props"`
 	UptimeSec     int64  `json:"uptime_sec"`
+	LastSeenUnix  int64  `json:"last_seen_unix,omitempty"`
+}
+
+type DirectoryResponse struct {
+	Worlds []StatusResponse `json:"worlds"`
 }
 
 type outboundFrame struct {
@@ -221,6 +230,7 @@ type RelayServer struct {
 	props           map[string]WireMsg
 	propAssemblies  map[string]*RelayAssetAssembler
 	ipConns         map[string]int
+	announcedWorlds map[string]StatusResponse
 }
 
 type RelayAssetAssembler struct {
@@ -308,10 +318,11 @@ func main() {
 		cliAdmins:     cliAdmins,
 		bannedKeys:    make(map[string]bool),
 		blockedItems:  make(map[string]bool),
-		clients:        make(map[string]*ClientConn),
-		props:          make(map[string]WireMsg),
-		propAssemblies: make(map[string]*RelayAssetAssembler),
-		ipConns:        make(map[string]int),
+		clients:         make(map[string]*ClientConn),
+		props:           make(map[string]WireMsg),
+		propAssemblies:  make(map[string]*RelayAssetAssembler),
+		ipConns:         make(map[string]int),
+		announcedWorlds: make(map[string]StatusResponse),
 	}
 
 	srv.reloadConfigFiles(true)
@@ -471,10 +482,9 @@ func (s *RelayServer) reloadConfigFiles(force bool) {
 					} else if !strings.HasPrefix(propID, "baked_") {
 						propID = "baked_" + propID
 					}
-					yaw := bp.Yaw
-					if math.IsNaN(float64(yaw)) || math.IsInf(float64(yaw), 0) {
-						yaw = 0
-					}
+					yaw := sanitizeFiniteFloat(bp.Yaw)
+					pitch := sanitizeFiniteFloat(bp.Pitch)
+					roll := sanitizeFiniteFloat(bp.Roll)
 					scale := bp.Scale
 					if math.IsNaN(float64(scale)) || math.IsInf(float64(scale), 0) || scale <= 0 {
 						scale = 1.0
@@ -493,6 +503,8 @@ func (s *RelayServer) reloadConfigFiles(force bool) {
 						Hash:   hLower,
 						Pos:    []float32{bp.Pos[0], bp.Pos[1], bp.Pos[2]},
 						Yaw:    yaw,
+						Pitch:  pitch,
+						Roll:   roll,
 						Scale:  scale,
 					}
 				}
@@ -832,6 +844,80 @@ func (s *RelayServer) handleStatus(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+func (s *RelayServer) handleDirectory(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+
+	if r.Method == http.MethodPost {
+		var ping StatusResponse
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16*1024)).Decode(&ping); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		wURL := strings.TrimSpace(ping.WorldURL)
+		if !strings.HasPrefix(wURL, "http://") && !strings.HasPrefix(wURL, "https://") {
+			http.Error(w, "world_url must be http(s)", http.StatusBadRequest)
+			return
+		}
+		ping.Title = sanitizeControlChars(ping.Title, 64)
+		if ping.Title == "" {
+			ping.Title = "Untitled World"
+		}
+		ping.Domain = sanitizeControlChars(ping.Domain, 64)
+		ping.PlacementMode = sanitizeControlChars(ping.PlacementMode, 24)
+		if ping.Online < 0 {
+			ping.Online = 0
+		}
+		if ping.Props < 0 {
+			ping.Props = 0
+		}
+		ping.LastSeenUnix = time.Now().Unix()
+
+		s.mu.Lock()
+		if len(s.announcedWorlds) < 256 || s.announcedWorlds[wURL].WorldURL != "" {
+			s.announcedWorlds[wURL] = ping
+		}
+		s.mu.Unlock()
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+		return
+	}
+
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	now := time.Now().Unix()
+	s.mu.Lock()
+	selfEntry := StatusResponse{
+		ProtoVersion:  ProtocolVersion,
+		Title:         s.worldTitle,
+		Domain:        s.domain,
+		WorldURL:      s.worldURL,
+		PlacementMode: s.placementMode,
+		Online:        len(s.clients),
+		Props:         len(s.props),
+		UptimeSec:     int64(time.Since(s.startedAt).Seconds()),
+		LastSeenUnix:  now,
+	}
+	list := []StatusResponse{selfEntry}
+	for k, entry := range s.announcedWorlds {
+		if now-entry.LastSeenUnix > 180 {
+			delete(s.announcedWorlds, k)
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(entry.WorldURL), strings.TrimSpace(s.worldURL)) {
+			continue
+		}
+		list = append(list, entry)
+	}
+	s.mu.Unlock()
+
+	_ = json.NewEncoder(w).Encode(DirectoryResponse{Worlds: list})
+}
+
 func (s *RelayServer) handleRoot(w http.ResponseWriter, r *http.Request) {
 	if websocket.IsWebSocketUpgrade(r) {
 		s.handleWS(w, r)
@@ -839,6 +925,10 @@ func (s *RelayServer) handleRoot(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.URL.Path == "/status.json" {
 		s.handleStatus(w, r)
+		return
+	}
+	if r.URL.Path == "/directory.json" {
+		s.handleDirectory(w, r)
 		return
 	}
 	if !s.serveHTTP {
@@ -1214,6 +1304,13 @@ func isValidHex64(s string) bool {
 	return true
 }
 
+func sanitizeFiniteFloat(v float32) float32 {
+	if math.IsNaN(float64(v)) || math.IsInf(float64(v), 0) {
+		return 0
+	}
+	return v
+}
+
 func finiteVec3(p []float32) bool {
 	if len(p) != 3 {
 		return false
@@ -1428,11 +1525,13 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	defer func() {
 		s.mu.Lock()
+		wasCurrent := false
 		if cur, ok := s.clients[auth.PubKey]; ok && cur == cc {
 			delete(s.clients, auth.PubKey)
+			wasCurrent = true
 		}
 		var removed []string
-		if s.placementMode == "ephemeral" {
+		if wasCurrent && s.placementMode == "ephemeral" {
 			for id, pr := range s.props {
 				if pr.PubKey == auth.PubKey {
 					delete(s.props, id)
@@ -1442,9 +1541,11 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.Unlock()
 
-		s.broadcast(auth.PubKey, WireMsg{Type: "LEAVE", PubKey: auth.PubKey}, false)
-		for _, id := range removed {
-			s.broadcast(auth.PubKey, WireMsg{Type: "PROP_REMOVE", PropID: id}, false)
+		if wasCurrent {
+			s.broadcast(auth.PubKey, WireMsg{Type: "LEAVE", PubKey: auth.PubKey}, false)
+			for _, id := range removed {
+				s.broadcast(auth.PubKey, WireMsg{Type: "PROP_REMOVE", PropID: id}, false)
+			}
 		}
 		log.Printf("Player left: %s (%s)", cc.nick, auth.PubKey[:12])
 	}()
@@ -1489,9 +1590,9 @@ func (s *RelayServer) handleWS(w http.ResponseWriter, r *http.Request) {
 				s.sendError(cc, "ERR_INVALID_POS", "position must be 3 finite floats")
 				continue
 			}
-			if math.IsNaN(float64(msg.Yaw)) || math.IsInf(float64(msg.Yaw), 0) {
-				msg.Yaw = 0
-			}
+			msg.Yaw = sanitizeFiniteFloat(msg.Yaw)
+			msg.Pitch = sanitizeFiniteFloat(msg.Pitch)
+			msg.Roll = sanitizeFiniteFloat(msg.Roll)
 
 			s.mu.Lock()
 			if len(msg.Pos) == 3 {

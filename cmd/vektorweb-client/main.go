@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -52,6 +53,8 @@ type WorldBakedProp struct {
 	Owner string    `toml:"owner"`
 	Pos   []float32 `toml:"pos"`
 	Yaw   float32   `toml:"yaw"`
+	Pitch float32   `toml:"pitch"`
+	Roll  float32   `toml:"roll"`
 	Scale float32   `toml:"scale"`
 }
 
@@ -73,6 +76,10 @@ type WorldManifest struct {
 		MaxAvatarMB   int    `toml:"max_avatar_mb"`
 		MaxItemMB     int    `toml:"max_item_mb"`
 	} `toml:"rules"`
+	Audio struct {
+		StreamURL string `toml:"stream_url"`
+		Title     string `toml:"title"`
+	} `toml:"audio"`
 	Portals []WorldPortal    `toml:"portals"`
 	Props   []WorldBakedProp `toml:"props"`
 }
@@ -106,6 +113,7 @@ type ClientSettings struct {
 	FOV          float32                 `toml:"fov"`
 	MouseSens    float32                 `toml:"mouse_sens"`
 	VoiceVolume  float32                 `toml:"voice_volume"`
+	AmbientVol   float32                 `toml:"ambient_volume"`
 	ShowRadar    bool                    `toml:"show_radar"`
 	ShowTags     bool                    `toml:"show_tags"`
 	ShowCross    bool                    `toml:"show_crosshair"`
@@ -120,6 +128,7 @@ func defaultClientSettings() ClientSettings {
 		FOV:          72.0,
 		MouseSens:    0.0025,
 		VoiceVolume:  1.0,
+		AmbientVol:   0.65,
 		ShowRadar:    true,
 		ShowTags:     true,
 		ShowCross:    true,
@@ -146,6 +155,9 @@ func loadClientSettings(path string) ClientSettings {
 	if cfg.VoiceVolume < 0 || cfg.VoiceVolume > 2.0 {
 		cfg.VoiceVolume = 1.0
 	}
+	if cfg.AmbientVol < 0 || cfg.AmbientVol > 1.0 {
+		cfg.AmbientVol = 0.65
+	}
 	if cfg.Outfits == nil {
 		cfg.Outfits = make(map[string]OutfitPreset)
 	}
@@ -161,6 +173,7 @@ func saveClientSettings(path string, cfg ClientSettings) {
 	fmt.Fprintf(&sb, "fov = %.1f\n", cfg.FOV)
 	fmt.Fprintf(&sb, "mouse_sens = %.4f\n", cfg.MouseSens)
 	fmt.Fprintf(&sb, "voice_volume = %.2f\n", cfg.VoiceVolume)
+	fmt.Fprintf(&sb, "ambient_volume = %.2f\n", cfg.AmbientVol)
 	fmt.Fprintf(&sb, "show_radar = %v\n", cfg.ShowRadar)
 	fmt.Fprintf(&sb, "show_tags = %v\n", cfg.ShowTags)
 	fmt.Fprintf(&sb, "show_crosshair = %v\n", cfg.ShowCross)
@@ -194,6 +207,8 @@ type WireMsg struct {
 	Nick         string    `json:"nick,omitempty"`
 	Pos          []float32 `json:"pos,omitempty"`
 	Yaw          float32   `json:"yaw,omitempty"`
+	Pitch        float32   `json:"pitch,omitempty"`
+	Roll         float32   `json:"roll,omitempty"`
 	Hash         string    `json:"hash,omitempty"`
 	Seq          int       `json:"seq,omitempty"`
 	Total        int       `json:"total,omitempty"`
@@ -263,6 +278,8 @@ type WorldProp struct {
 	Hash   string
 	Pos    rl.Vector3
 	Yaw    float32
+	Pitch  float32
+	Roll   float32
 	Scale  float32
 }
 
@@ -353,9 +370,91 @@ func modelFeetOffsetY(m rl.Model) float32 {
 	return -bb.Min.Y
 }
 
+func drawModelEuler(m rl.Model, pos rl.Vector3, yawDeg, pitchDeg, rollDeg, scale float32, tint rl.Color) {
+	if scale <= 0 {
+		scale = 1.0
+	}
+	if math.Abs(float64(pitchDeg)) < 0.01 && math.Abs(float64(rollDeg)) < 0.01 {
+		rl.DrawModelEx(m, pos, rl.NewVector3(0, 1, 0), yawDeg, rl.NewVector3(scale, scale, scale), tint)
+		return
+	}
+	const deg2rad = float32(math.Pi / 180.0)
+	orig := m.Transform
+	rot := rl.MatrixRotateXYZ(rl.NewVector3(pitchDeg*deg2rad, yawDeg*deg2rad, rollDeg*deg2rad))
+	m.Transform = rl.MatrixMultiply(orig, rot)
+	rl.DrawModelEx(m, pos, rl.NewVector3(0, 1, 0), 0, rl.NewVector3(scale, scale, scale), tint)
+	m.Transform = orig
+}
+
+type AmbientRadioPlayer struct {
+	mu      sync.Mutex
+	cmd     *exec.Cmd
+	url     string
+	muted   bool
+	vol     float32
+}
+
+func (a *AmbientRadioPlayer) Stop() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.cmd != nil && a.cmd.Process != nil {
+		_ = a.cmd.Process.Kill()
+		_ = a.cmd.Wait()
+	}
+	a.cmd = nil
+	a.url = ""
+}
+
+func (a *AmbientRadioPlayer) Start(streamURL string, vol float32) (string, bool) {
+	a.Stop()
+	clean := strings.TrimSpace(streamURL)
+	if clean == "" {
+		return "", false
+	}
+	u, err := url.Parse(clean)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return "", false
+	}
+	a.mu.Lock()
+	a.vol = vol
+	if a.muted || vol <= 0.01 {
+		a.url = clean
+		a.mu.Unlock()
+		return clean, true
+	}
+	pct := int(vol * 100)
+	if pct < 0 {
+		pct = 0
+	} else if pct > 100 {
+		pct = 100
+	}
+	var cmd *exec.Cmd
+	if _, err := exec.LookPath("mpv"); err == nil {
+		cmd = exec.Command("mpv", "--no-video", "--really-quiet", fmt.Sprintf("--volume=%d", pct), clean)
+	} else if _, err := exec.LookPath("ffplay"); err == nil {
+		cmd = exec.Command("ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", "-volume", strconv.Itoa(pct), clean)
+	} else if _, err := exec.LookPath("mpg123"); err == nil {
+		cmd = exec.Command("mpg123", "-q", clean)
+	}
+	if cmd == nil {
+		a.mu.Unlock()
+		return "", false
+	}
+	if err := cmd.Start(); err != nil {
+		a.mu.Unlock()
+		return "", false
+	}
+	a.cmd = cmd
+	a.url = clean
+	a.mu.Unlock()
+	go func(c *exec.Cmd) { _ = c.Wait() }(cmd)
+	return clean, true
+}
+
 type RayTarget struct {
 	Kind      string // "prop" | "peer"
 	ID        string // propID or peer PubKey
+	PropHash  string
 	Label     string
 	SubLabel  string
 	CanDelete bool
@@ -1492,6 +1591,8 @@ func main() {
 				Hash:   hLower,
 				Pos:    rl.NewVector3(bp.Pos[0], bp.Pos[1], bp.Pos[2]),
 				Yaw:    bp.Yaw,
+				Pitch:  bp.Pitch,
+				Roll:   bp.Roll,
 				Scale:  scale,
 			}
 			if ensureAssetQueued(netState, hLower) {
@@ -1544,8 +1645,24 @@ func main() {
 			go runRelayLoop(ctx, w.Manifest.World.RelayURL, kp, netState)
 		}
 	}
+	ambientRadio := &AmbientRadioPlayer{vol: cfg.AmbientVol}
+	defer ambientRadio.Stop()
+	startWorldAudio := func(w *LoadedWorld) {
+		ambientRadio.Stop()
+		if w != nil && strings.TrimSpace(w.Manifest.Audio.StreamURL) != "" {
+			if _, ok := ambientRadio.Start(w.Manifest.Audio.StreamURL, cfg.AmbientVol); ok {
+				label := sanitizeDisplayText(w.Manifest.Audio.Title, 40)
+				if label == "" {
+					label = sanitizeDisplayText(w.Manifest.Audio.StreamURL, 48)
+				}
+				netState.addChat("[RADIO]: Streaming world audio -> " + label + " ([U] mute/unmute)")
+			}
+		}
+	}
+
 	startRelayForWorld(activeWorld)
 	seedBakedProps(activeWorld)
+	startWorldAudio(activeWorld)
 
 	rl.SetConfigFlags(rl.FlagWindowResizable | rl.FlagMsaa4xHint)
 	rl.InitWindow(1280, 720, "VektorWeb - "+activeWorld.Manifest.World.Title)
@@ -1649,6 +1766,7 @@ func main() {
 	lastPortalHop := time.Time{}
 	ghostActive := false
 	var ownedPropIDs []string
+	nearProps := make(map[string]bool)
 	visitedWorlds := []string{activeWorld.URL}
 	var hopToWorld func(targetURL string, recordHistory bool)
 	hopToWorld = func(targetURL string, recordHistory bool) {
@@ -1680,6 +1798,7 @@ func main() {
 		netState.mu.Unlock()
 		ghostActive = false
 		ownedPropIDs = nil
+		nearProps = make(map[string]bool)
 
 		worldModel, worldAnims = loadModelWithAnims(activeWorld.EnvCacheGLB, fogShader, cfg.EnableFog)
 		rl.SetWindowTitle("VektorWeb - " + activeWorld.Manifest.World.Title)
@@ -1708,6 +1827,7 @@ func main() {
 		}
 		startRelayForWorld(activeWorld)
 		seedBakedProps(activeWorld)
+		startWorldAudio(activeWorld)
 		netState.addChat("[PORTAL]: Arrived at " + activeWorld.Manifest.World.Title)
 	}
 
@@ -1716,6 +1836,63 @@ func main() {
 	var dirStatusMu sync.RWMutex
 	dirStatuses := make(map[string]PortalStatusInfo)
 	refreshPortalStatuses := func(dir WorldDirectory) {
+		// Discover live announced worlds from active world's /directory.json if available
+		if activeWorld != nil && activeWorld.URL != "" && activeWorld.URL != "local://sandbox" {
+			if u, err := url.Parse(normalizeWorldURL(activeWorld.URL)); err == nil {
+				u.Path = "/directory.json"
+				u.RawQuery = ""
+				go func(dirEndpoint string) {
+					httpClient := &http.Client{Timeout: 4 * time.Second}
+					resp, err := httpClient.Get(dirEndpoint)
+					if err != nil || resp.StatusCode != http.StatusOK {
+						if resp != nil {
+							_ = resp.Body.Close()
+						}
+						return
+					}
+					defer resp.Body.Close()
+					var payload struct {
+						Worlds []struct {
+							Title     string `json:"title"`
+							WorldURL  string `json:"world_url"`
+							Online    int    `json:"online"`
+							Props     int    `json:"props"`
+						} `json:"worlds"`
+					}
+					if json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&payload) == nil {
+						for _, aw := range payload.Worlds {
+							wu := strings.TrimSpace(aw.WorldURL)
+							if wu == "" {
+								continue
+							}
+							cleanTitle := sanitizeDisplayText(aw.Title, 40)
+							dirStatusMu.Lock()
+							dirStatuses[wu] = PortalStatusInfo{
+								Checked:   true,
+								Online:    true,
+								Title:     cleanTitle,
+								PeerCount: aw.Online,
+								PropCount: aw.Props,
+							}
+							existsInDir := false
+							for _, existingW := range directory.Worlds {
+								if normalizeWorldURL(existingW.URL) == normalizeWorldURL(wu) {
+									existsInDir = true
+									break
+								}
+							}
+							if !existsInDir && len(directory.Worlds) < 8 {
+								directory.Worlds = append(directory.Worlds, struct {
+									Name string `toml:"name"`
+									URL  string `toml:"url"`
+								}{Name: cleanTitle, URL: wu})
+							}
+							dirStatusMu.Unlock()
+						}
+					}
+				}(u.String())
+			}
+		}
 		for _, w := range dir.Worlds {
 			rawU := strings.TrimSpace(w.URL)
 			if rawU == "" {
@@ -1801,6 +1978,8 @@ func main() {
 	grounded := false
 	snapToGrid := false
 	ghostYawOffset := float32(0)
+	ghostPitchOffset := float32(0)
+	ghostRollOffset := float32(0)
 	ghostYOffset := float32(0)
 	ghostScale := float32(1.0)
 	showRangeRing := false
@@ -2275,13 +2454,14 @@ func main() {
 					} else if canDel {
 						ownerLabel = "You"
 					}
-					sub := "Owner: " + ownerLabel
+					sub := "Owner: " + ownerLabel + "  |  [E] Interact"
 					if canDel {
-						sub += "  |  [Del] Remove Prop"
+						sub += "  |  [C] Clone  |  [Del] Remove"
 					}
 					lookedAt = &RayTarget{
 						Kind:      "prop",
 						ID:        prop.PropID,
+						PropHash:  prop.Hash,
 						Label:     "Prop " + prop.PropID[:minInt(6, len(prop.PropID))],
 						SubLabel:  sub,
 						CanDelete: canDel,
@@ -2324,12 +2504,12 @@ func main() {
 				helpOpen = false
 			}
 		} else if settingsOpen {
-			// 0: FOV, 1: Mouse Sens, 2: Voice Volume, 3: Avatar Scale, 4: Mini-Radar, 5: Nameplates, 6: Crosshair, 7: Distance Fog
+			// 0: FOV, 1: Mouse Sens, 2: Voice Volume, 3: Ambient Radio Vol, 4: Avatar Scale, 5: Mini-Radar, 6: Nameplates, 7: Crosshair, 8: Distance Fog
 			if rl.IsKeyPressed(rl.KeyDown) || rl.IsKeyPressed(rl.KeyS) {
-				settingsCursor = (settingsCursor + 1) % 8
+				settingsCursor = (settingsCursor + 1) % 9
 			}
 			if rl.IsKeyPressed(rl.KeyUp) || rl.IsKeyPressed(rl.KeyW) {
-				settingsCursor = (settingsCursor + 7) % 8
+				settingsCursor = (settingsCursor + 8) % 9
 			}
 			left := rl.IsKeyPressed(rl.KeyLeft) || rl.IsKeyPressed(rl.KeyA)
 			right := rl.IsKeyPressed(rl.KeyRight) || rl.IsKeyPressed(rl.KeyD) || rl.IsKeyPressed(rl.KeyEnter)
@@ -2347,14 +2527,17 @@ func main() {
 				case 2:
 					cfg.VoiceVolume = clampFloat32(cfg.VoiceVolume+dir*0.1, 0.0, 2.0)
 				case 3:
-					cfg.AvatarScale = clampFloat32(cfg.AvatarScale+dir*0.1, 0.25, 4.0)
+					cfg.AmbientVol = clampFloat32(cfg.AmbientVol+dir*0.1, 0.0, 1.0)
+					startWorldAudio(activeWorld)
 				case 4:
-					cfg.ShowRadar = !cfg.ShowRadar
+					cfg.AvatarScale = clampFloat32(cfg.AvatarScale+dir*0.1, 0.25, 4.0)
 				case 5:
-					cfg.ShowTags = !cfg.ShowTags
+					cfg.ShowRadar = !cfg.ShowRadar
 				case 6:
-					cfg.ShowCross = !cfg.ShowCross
+					cfg.ShowTags = !cfg.ShowTags
 				case 7:
+					cfg.ShowCross = !cfg.ShowCross
+				case 8:
 					cfg.EnableFog = !cfg.EnableFog
 					setModelFog(worldModel, cfg.EnableFog)
 					for _, m := range loadedModels {
@@ -2602,10 +2785,12 @@ func main() {
 				}
 			}
 		} else if dirOpen {
+			dirStatusMu.Lock()
 			visDirCount := len(directory.Worlds)
 			if visDirCount > 8 {
 				visDirCount = 8
 			}
+			var hopTarget string
 			if rl.IsKeyPressed(rl.KeyDown) || rl.IsKeyPressed(rl.KeyS) {
 				if visDirCount > 0 {
 					dirCursor = (dirCursor + 1) % visDirCount
@@ -2618,8 +2803,8 @@ func main() {
 			}
 			if rl.IsKeyPressed(rl.KeyEnter) && visDirCount > 0 {
 				idx := dirCursor % visDirCount
+				hopTarget = directory.Worlds[idx].URL
 				dirOpen = false
-				hopToWorld(directory.Worlds[idx].URL, true)
 			}
 			if rl.IsKeyPressed(rl.KeyF) && visDirCount > 0 {
 				idx := dirCursor % visDirCount
@@ -2637,10 +2822,14 @@ func main() {
 			}
 			for i := 0; i < visDirCount; i++ {
 				if rl.IsKeyPressed(int32(rl.KeyOne + i)) {
+					hopTarget = directory.Worlds[i].URL
 					dirOpen = false
-					hopToWorld(directory.Worlds[i].URL, true)
 					break
 				}
+			}
+			dirStatusMu.Unlock()
+			if hopTarget != "" {
+				hopToWorld(hopTarget, true)
 			}
 			if rl.IsKeyPressed(rl.KeyR) {
 				refreshPortalStatuses(directory)
@@ -2675,7 +2864,7 @@ func main() {
 						netState.addChat("[MOVE]: Free-Fly Camera ON")
 					}
 				}
-				if rl.IsKeyPressed(rl.KeyC) && walkMode {
+				if rl.IsKeyPressed(rl.KeyC) && walkMode && (lookedAt == nil || lookedAt.Kind != "prop" || !lookedAt.CanDelete) {
 					fwdNow := rl.Vector3Normalize(rl.Vector3Subtract(cam.Target, cam.Position))
 					thirdPerson = !thirdPerson
 					if thirdPerson {
@@ -2711,19 +2900,55 @@ func main() {
 					netState.addChat("[SPAWN]: Returned to world spawn point")
 				}
 
-				// Look-at interaction: [Delete] removes your targeted prop; [E] opens trade for targeted peer
+				// Look-at interaction: [Delete] removes your targeted prop; [C] clones your prop into Build Mode; [E] interacts with prop or offers trade to peer
 				if lookedAt != nil {
-					if lookedAt.Kind == "prop" && lookedAt.CanDelete && rl.IsKeyPressed(rl.KeyDelete) {
-						netState.mu.Lock()
-						delete(netState.props, lookedAt.ID)
-						netState.mu.Unlock()
-						for i := len(ownedPropIDs) - 1; i >= 0; i-- {
-							if ownedPropIDs[i] == lookedAt.ID {
-								ownedPropIDs = append(ownedPropIDs[:i], ownedPropIDs[i+1:]...)
+					if lookedAt.Kind == "prop" {
+						if lookedAt.CanDelete && rl.IsKeyPressed(rl.KeyDelete) {
+							netState.mu.Lock()
+							delete(netState.props, lookedAt.ID)
+							netState.mu.Unlock()
+							for i := len(ownedPropIDs) - 1; i >= 0; i-- {
+								if ownedPropIDs[i] == lookedAt.ID {
+									ownedPropIDs = append(ownedPropIDs[:i], ownedPropIDs[i+1:]...)
+								}
+							}
+							_ = netState.sendJSON(WireMsg{Type: "PROP_REMOVE", PropID: lookedAt.ID})
+							netState.addChat("[PROP]: Removed " + lookedAt.Label)
+						} else if lookedAt.CanDelete && rl.IsKeyPressed(rl.KeyC) {
+							netState.mu.RLock()
+							srcProp, ok := netState.props[lookedAt.ID]
+							netState.mu.RUnlock()
+							if ok {
+								for idx, it := range propInv {
+									if strings.EqualFold(it.Hash, srcProp.Hash) {
+										propIdx = idx
+										break
+									}
+								}
+								ghostScale = srcProp.Scale
+								if ghostScale <= 0 {
+									ghostScale = 1.0
+								}
+								ghostPitchOffset = srcProp.Pitch
+								ghostRollOffset = srcProp.Roll
+								ghostActive = true
+								netState.addChat("[BUILD]: Cloned " + lookedAt.Label + " into Build Mode ([P] to place)")
+							}
+						} else if rl.IsKeyPressed(rl.KeyE) {
+							netState.mu.RLock()
+							pr, ok := netState.props[lookedAt.ID]
+							netState.mu.RUnlock()
+							if ok {
+								if activeWorld.Sandbox != nil {
+									if hooks, hasHooks := any(activeWorld.Sandbox).(interface {
+										NotifyPropInteract(propID, hash, owner string)
+									}); hasHooks {
+										hooks.NotifyPropInteract(pr.PropID, pr.Hash, pr.Owner)
+									}
+								}
+								netState.addChat(fmt.Sprintf("[INTERACT]: Activated %s", lookedAt.Label))
 							}
 						}
-						_ = netState.sendJSON(WireMsg{Type: "PROP_REMOVE", PropID: lookedAt.ID})
-						netState.addChat("[PROP]: Removed " + lookedAt.Label)
 					} else if lookedAt.Kind == "peer" && !ghostActive && rl.IsKeyPressed(rl.KeyE) {
 						avatarInv = scanInventoryFolder(avatarsDir, "avatar", cacheDir, kp.PubHex(), maxAvMB*1024*1024, localAssets)
 						propInv = scanInventoryFolder(itemsDir, "prop", cacheDir, kp.PubHex(), maxItemMB*1024*1024, localAssets)
@@ -2793,6 +3018,19 @@ func main() {
 						netState.addChat("[HUD]: Spawn waypoint marker OFF")
 					}
 				}
+				if rl.IsKeyPressed(rl.KeyU) {
+					ambientRadio.mu.Lock()
+					ambientRadio.muted = !ambientRadio.muted
+					isAmbMuted := ambientRadio.muted
+					ambientRadio.mu.Unlock()
+					if isAmbMuted {
+						ambientRadio.Stop()
+						netState.addChat("[RADIO]: Ambient world audio muted")
+					} else {
+						startWorldAudio(activeWorld)
+						netState.addChat("[RADIO]: Ambient world audio unmuted")
+					}
+				}
 				if rl.IsKeyPressed(rl.KeyM) {
 					netState.mu.Lock()
 					netState.muted = !netState.muted
@@ -2808,9 +3046,11 @@ func main() {
 				if ghostActive {
 					if rl.IsKeyPressed(rl.KeyR) {
 						ghostYawOffset = 0
+						ghostPitchOffset = 0
+						ghostRollOffset = 0
 						ghostYOffset = 0
 						ghostScale = 1.0
-						netState.addChat("[BUILD]: Reset prop rotation, height, and scale")
+						netState.addChat("[BUILD]: Reset prop rotation, tilt, height, and scale")
 					}
 					if rl.IsKeyPressed(rl.KeyF4) {
 						spawn = safeSpawnPosition(worldModel, playerHeadPos)
@@ -2830,6 +3070,12 @@ func main() {
 					}
 					if rl.IsKeyDown(rl.KeyE) {
 						ghostYawOffset += 90.0 * float32(dt)
+					}
+					if rl.IsKeyDown(rl.KeyZ) {
+						ghostPitchOffset += 90.0 * float32(dt)
+					}
+					if rl.IsKeyDown(rl.KeyX) {
+						ghostRollOffset += 90.0 * float32(dt)
 					}
 					if rl.IsKeyDown(rl.KeyPageUp) {
 						ghostYOffset += 1.5 * float32(dt)
@@ -2856,6 +3102,8 @@ func main() {
 						Hash:   activeProp.Hash,
 						Pos:    ghostPos,
 						Yaw:    ghostYaw,
+						Pitch:  ghostPitchOffset,
+						Roll:   ghostRollOffset,
 						Scale:  ghostScale,
 					}
 					netState.mu.Lock()
@@ -2869,12 +3117,14 @@ func main() {
 						Hash:   activeProp.Hash,
 						Pos:    []float32{ghostPos.X, ghostPos.Y, ghostPos.Z},
 						Yaw:    ghostYaw,
+						Pitch:  ghostPitchOffset,
+						Roll:   ghostRollOffset,
 						Scale:  ghostScale,
 					})
 					netState.addChat(fmt.Sprintf("[PROP]: Placed %s (%s...)", activeProp.Name, propID[:6]))
 				}
 
-				if rl.IsKeyPressed(rl.KeyX) && len(ownedPropIDs) > 0 {
+				if !ghostActive && rl.IsKeyPressed(rl.KeyX) && len(ownedPropIDs) > 0 {
 					netState.mu.Lock()
 					var lastID string
 					for len(ownedPropIDs) > 0 {
@@ -3091,7 +3341,7 @@ func main() {
 			rl.DrawCylinderWires(spawnFloor, 0.85, 0.85, 2.0, 12, rl.Fade(rl.Gold, 0.65))
 			if activeProp.Hash != "" {
 				if mod, ok := loadedModels[activeProp.Hash]; ok {
-					rl.DrawModelEx(mod, ghostPos, rl.NewVector3(0, 1, 0), ghostYaw, rl.NewVector3(ghostScale, ghostScale, ghostScale), rl.Fade(rl.Lime, 0.55))
+					drawModelEuler(mod, ghostPos, ghostYaw, ghostPitchOffset, ghostRollOffset, ghostScale, rl.Fade(rl.Lime, 0.55))
 				}
 				rl.DrawCircle3D(ghostPos, 0.5, rl.NewVector3(1, 0, 0), 90, rl.Lime)
 			}
@@ -3112,9 +3362,24 @@ func main() {
 				if s <= 0 {
 					s = 1.0
 				}
-				rl.DrawModelEx(mod, prop.Pos, rl.NewVector3(0, 1, 0), prop.Yaw, rl.NewVector3(s, s, s), rl.White)
+				drawModelEuler(mod, prop.Pos, prop.Yaw, prop.Pitch, prop.Roll, s, rl.White)
 			} else {
 				rl.DrawCubeWires(prop.Pos, 0.8, 0.8, 0.8, rl.Gold)
+			}
+			if activeWorld.Sandbox != nil {
+				if hooks, hasHooks := any(activeWorld.Sandbox).(interface {
+					NotifyPropProximity(propID, hash string, entered bool)
+				}); hasHooks {
+					dProp := rl.Vector3Distance(bodyHeadPos, prop.Pos)
+					inRange := dProp <= 2.4
+					if inRange && !nearProps[prop.PropID] {
+						nearProps[prop.PropID] = true
+						hooks.NotifyPropProximity(prop.PropID, prop.Hash, true)
+					} else if !inRange && nearProps[prop.PropID] {
+						delete(nearProps, prop.PropID)
+						hooks.NotifyPropProximity(prop.PropID, prop.Hash, false)
+					}
+				}
 			}
 		}
 
@@ -3260,7 +3525,7 @@ func main() {
 			if snapToGrid {
 				snapTxt = "ON"
 			}
-			buildLine = fmt.Sprintf("[BUILD: %s] Snap[B]:%s | Yaw:%.0f | Y:%.2f | Scale:%.2fx | [F4] Spawn | [G/Esc] Exit", activeProp.Name, snapTxt, ghostYawOffset, ghostYOffset, ghostScale)
+			buildLine = fmt.Sprintf("[BUILD: %s] Snap[B]:%s | Y/P/R:%.0f/%.0f/%.0f | H:%.2f | %.2fx | [G/Esc] Exit", activeProp.Name, snapTxt, ghostYawOffset, ghostPitchOffset, ghostRollOffset, ghostYOffset, ghostScale)
 		}
 
 		// Auto-size HUD width to fit content cleanly while reserving space for top-right status/radar
@@ -3608,7 +3873,7 @@ func main() {
 
 		if settingsOpen {
 			drawModalBackdrop(sw, sh)
-			mw, mh := int32(580), int32(410)
+			mw, mh := int32(580), int32(445)
 			mx, my := (sw-mw)/2, (sh-mh)/2
 			drawGlassPanel(mx, my, mw, mh, rl.SkyBlue, 246)
 			drawUITextShadow("CLIENT SETTINGS (Saved to settings.toml)", mx+24, my+18, 19, rl.SkyBlue)
@@ -3617,6 +3882,7 @@ func main() {
 				fmt.Sprintf("Field of View (FOV) : %.0f deg", cfg.FOV),
 				fmt.Sprintf("Mouse Sensitivity   : %.4f", cfg.MouseSens),
 				fmt.Sprintf("Voice Volume        : %.0f%%", cfg.VoiceVolume*100),
+				fmt.Sprintf("Ambient Radio Vol   : %.0f%%", cfg.AmbientVol*100),
 				fmt.Sprintf("3rd-Person Av Scale : %.2fx", cfg.AvatarScale),
 				fmt.Sprintf("Mini-Radar HUD      : %v", cfg.ShowRadar),
 				fmt.Sprintf("3D Nameplates       : %v", cfg.ShowTags),
@@ -3785,11 +4051,11 @@ func main() {
 				"Drag & Drop .glb : Equip avatar or import prop into inventory",
 				"WASD + Mouse     : Walk / Look ([Shift] Sprint, [Space] Jump, [F] Walk/Fly)",
 				"[C] / [R]        : Toggle 3rd-Person View (Wheel zooms) / Return to Spawn",
-				"Look-At Target   : [Del] Remove your prop | [E] Offer trade to peer",
+				"Look-At Target   : [E] Interact/Trade | [C] Clone prop | [Del] Remove prop",
 				"[T] or [/]       : Chat (/help, /me, /outfit, /clearmyprops, /exportworld, /nick, /bookmark)",
-				"[V] / [M]        : Hold Push-to-Talk voice (35m) / Mute incoming voice",
+				"[V] / [M] / [U]  : Hold Push-to-Talk (35m) / Mute voice / Mute world radio",
 				"[G]/[Esc] [B] [N]: Toggle/Exit Build Mode / Snap-to-Grid / Next prop ([F4] Set Spawn)",
-				"[Q]/[E] [PgUp/Dn]: Rotate & nudge prop height ([+/-] scale, [P]/[X] place/undo)",
+				"[Q/E] [Z/X] [PgU]: Yaw / Pitch & Roll tilt / Height ([+/-] scale, [P] place)",
 				"[Tab] / [F12]    : World Portal Directory / Save Screenshot to exports/",
 				"[F2] / [F3]      : Client Settings (FOV, Sens, Fog) / Online Peers List",
 			}
@@ -4290,6 +4556,8 @@ func handleChatCommand(
 			owner string
 			pos   rl.Vector3
 			yaw   float32
+			pitch float32
+			roll  float32
 			scale float32
 		}
 		var list []snapProp
@@ -4300,6 +4568,8 @@ func handleChatCommand(
 				owner: pr.Owner,
 				pos:   pr.Pos,
 				yaw:   pr.Yaw,
+				pitch: pr.Pitch,
+				roll:  pr.Roll,
 				scale: pr.Scale,
 			})
 		}
@@ -4322,6 +4592,10 @@ func handleChatCommand(
 			fmt.Fprintf(&sb, "owner = %q\n", sp.owner)
 			fmt.Fprintf(&sb, "pos = [%.3f, %.3f, %.3f]\n", sp.pos.X, sp.pos.Y, sp.pos.Z)
 			fmt.Fprintf(&sb, "yaw = %.2f\n", sp.yaw)
+			if sp.pitch != 0 || sp.roll != 0 {
+				fmt.Fprintf(&sb, "pitch = %.2f\n", sp.pitch)
+				fmt.Fprintf(&sb, "roll = %.2f\n", sp.roll)
+			}
 			fmt.Fprintf(&sb, "scale = %.2f\n\n", s)
 		}
 
@@ -4783,6 +5057,12 @@ func runRelaySession(ctx context.Context, conn *websocket.Conn, relayHost string
 			if math.IsNaN(float64(msg.Yaw)) || math.IsInf(float64(msg.Yaw), 0) {
 				msg.Yaw = 0
 			}
+			if math.IsNaN(float64(msg.Pitch)) || math.IsInf(float64(msg.Pitch), 0) {
+				msg.Pitch = 0
+			}
+			if math.IsNaN(float64(msg.Roll)) || math.IsInf(float64(msg.Roll), 0) {
+				msg.Roll = 0
+			}
 			scale := msg.Scale
 			if math.IsNaN(float64(scale)) || math.IsInf(float64(scale), 0) || scale <= 0 {
 				scale = 1.0
@@ -4801,6 +5081,8 @@ func runRelaySession(ctx context.Context, conn *websocket.Conn, relayHost string
 				Hash:   msg.Hash,
 				Pos:    rl.NewVector3(msg.Pos[0], msg.Pos[1], msg.Pos[2]),
 				Yaw:    msg.Yaw,
+				Pitch:  msg.Pitch,
+				Roll:   msg.Roll,
 				Scale:  scale,
 			}
 			needAsset := ensureAssetQueued(ns, msg.Hash)
