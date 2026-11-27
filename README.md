@@ -1,154 +1,72 @@
 # VektorWeb
 
-**VektorWeb** is a lightweight, zero-database, web-hosted 3D social protocol and desktop client/relay suite written in Go. Instead of heavy proprietary game engines, multi-gigabyte SDKs, or complex federated databases, VektorWeb treats a 3D world like a static web directory (`world.toml` + `.glb` + `world.lua`) paired with a single-port HTTP + WebSocket relay (`vektorweb.v1`) and client-side Ed25519 cryptographic keys.
+![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat-square&logo=go)
+![Raylib](https://img.shields.io/badge/Renderer-Raylib-lightgrey?style=flat-square)
+![License](https://img.shields.io/badge/Architecture-P2P%20Hybrid-blue?style=flat-square)
+![AI Assisted](https://img.shields.io/badge/Development-AI%20Assisted-purple?style=flat-square)
+
+**VektorWeb** is a lightweight, decentralized 3D virtual world client and stateless relay built in Go and Raylib. Worlds are self-hosted over standard HTTP(S) (`world.toml`, `environment.glb`, `world.lua`), players authenticate with local Ed25519 cryptographic keypairs, and 3D `.glb` avatars and props transfer peer-to-peer with local client caching and `glbguard` validation.
+
+> **Transparency & Development Note:** VektorWeb is a hobbyist open-source project built using an AI-assisted coding workflow. Architecture design, protocol rules, feature direction, security constraints, and live deployment testing are human-directed, while Go implementation and refactoring were written collaboratively with AI assistance. All code is tested on real hardware and live relays before release.
 
 ---
 
-## Live Public Demo Server
+## Architecture Overview
 
-Join the official **VektorWeb Nexus Plaza** demo world hosted on `vektor.whitenode45.ddns.net`:
-
-* **Join URL:** `https://vektor.whitenode45.ddns.net/world.toml` (or `vektorweb://vektor.whitenode45.ddns.net/world.toml`)
-* **Relay Endpoint:** `wss://vektor.whitenode45.ddns.net/`
-* **Live Status Endpoint:** `https://vektor.whitenode45.ddns.net/status.json`
-
-Connect directly from the client:
-```bash
-./vektorweb-client -world https://vektor.whitenode45.ddns.net/world.toml
-```
-
----
-
-## Core Architecture
-
-* **Web-Hosted Worlds (`world.toml`):** Any static web server—or the relay's built-in HTTP file server—can host a world folder containing `world.toml`, `environment.glb`, and an optional sandboxed `world.lua` script.
-* **Single-Binary Relay (`vektorweb-relay`):** Pure Go binary with zero CGO or external database dependencies. Serves both HTTP world assets and the `vektorweb.v1` WebSocket protocol on a single port, plus an unauthenticated `/status.json` health/population endpoint and optional directory ping (`-announce`).
-* **Desktop 3D Client (`vektorweb-client`):** Built with `raylib-go`, featuring walk/fly physics, 1st-person and 3rd-person orbit cameras, spatial push-to-talk voice chat (`35m` falloff), live prop building, drag-and-drop `.glb` imports, and peer-to-peer asset transfers.
-* **Client-Side Ed25519 Identity & Signed Asset Licenses:** Automatically generates a local Ed25519 keypair (`identity.key`) for passwordless challenge-response authentication (`grid-auth`) and creator-signed `VEKTORWEB_LICENSE_V1` ownership certificates (supporting both vendor-locked and transferable/resellable `.glb` items), with `Nick#pubkey6` display disambiguation.
-* **Hardened Asset & Script Sandboxing:** Validates incoming `.glb` geometry and buffer bounds (`glbguard`), verifies Subresource Integrity (`SHA-256`) hashes, and executes `world.lua` inside a stripped Lua VM (`luavm`) with zero OS/filesystem/network access and a strict `15ms/frame` CPU budget.
+- **Stateless Relay (`vektorweb-relay`):** Handles Ed25519 challenge-response authentication, player presence/pose forwarding, spatial proximity voice (`35m`), chat, prop transform sync, and optional `/directory.json` world discovery.
+- **P2P Asset Swarm (`vektorweb-client`):** Transfers `.glb` avatars and props directly between connected peers in 48 KB chunks, verifies SHA-256 hashes, enforces `glbguard` size/geometry limits (`5 MB` props / `15 MB` avatars / `50 MB` worlds), and caches validated assets locally in `~/.vektorweb-client/cache/`.
+- **Sandboxed World Scripting (`world.lua`):** Runs per-client inside a restricted Lua VM with zero filesystem, OS, or network access and a strict `15ms/frame` CPU budget.
+- **Cryptographic Asset Licensing (`VEKTORWEB_LICENSE_V1`):** Creators can mint Ed25519-signed vendor-locked or transferable licenses when trading avatars and props in-world.
+- **Companion Creation Suite (`VektorWeb Studio`):** Asset and world generation is kept in a separate standalone application (`vektorweb-studio`) so the runtime client and relay remain lean.
 
 ---
 
 ## Quick Start
 
-### 1. Build
+### 1. Build Client & Relay
+
 ```bash
+chmod +x build.sh
 ./build.sh
 ```
-This compiles `vektorweb-relay` and `vektorweb-client` for your current platform (Linux, FreeBSD, OpenBSD, or Windows).
 
-### 2. Start a Local Relay
+### 2. Run a World Relay
+
 ```bash
-./vektorweb-relay
+./vektorweb-relay -addr 0.0.0.0:7777 -dir ./world -placement ephemeral
 ```
-On first run, `./vektorweb-relay` automatically generates a starter `./world/` directory (`world.toml`, `environment.glb`, `world.lua`, `bans.txt`, `blocked_items.txt`) and listens on `0.0.0.0:7777`.
 
-**Relay CLI Flags:**
-* `-addr 0.0.0.0:7777` — Listen host and port
-* `-domain 127.0.0.1` — Domain/IP bound to Ed25519 auth challenges
-* `-dir ./world` — World directory to serve
-* `-http=true` — Serve world files over HTTP on the same port (set `-http=false` behind Nginx/Caddy)
-* `-placement ephemeral` — Prop mode: `forbid` | `ephemeral` | `persistent`
-* `-trust-proxy` — Honor `X-Real-IP` / `X-Forwarded-For` behind a reverse proxy
-* `-announce <url>` — Optional public directory HTTP(S) URL to `POST` status pings every 60s
-* `-admin <pubkey1,pubkey2>` — Comma-separated 64-char hex admin Ed25519 public keys
+On first launch, `vektorweb-relay` automatically initializes `./world/` with a starter `world.toml`, `environment.glb`, `world.lua`, `bans.txt`, and `blocked_items.txt`.
 
 ### 3. Launch the Client
+
 ```bash
-./vektorweb-client -world https://vektor.whitenode45.ddns.net/world.toml
-```
-Or connect to your local relay:
-```bash
+# Connect to a local or remote world.toml (supports http://, https://, or vektorweb://):
 ./vektorweb-client -world http://127.0.0.1:7777/world.toml
 ```
-To test multiplayer locally on the same machine, launch a second profile in another terminal:
-```bash
-./vektorweb-client -profile peer2 -nomic -nick Guest2
-```
+
+Live demo node: `vektorweb://vektor.whitenode45.ddns.net/world.toml`
 
 ---
 
-## Client Controls & Slash Commands
+## Controls & Shortcuts
 
-### Keybinds
-| Key | Action |
+| Key / Input | Action |
 | :--- | :--- |
-| **`WASD` + Mouse** | Move and look (`[Shift]` Sprint, `[Space]` Jump, `[Esc]` Unlock/Lock cursor) |
-| **`[F]`** | Toggle Walk + Ground Collision / Free-Fly camera |
-| **`[C]`** | Toggle 1st-Person / 3rd-Person camera (Mouse wheel zooms distance) |
-| **`[R]` / `[H]`** | Return to world spawn point (reset prop in Build Mode) / Toggle Spawn Waypoint HUD |
-| **`[1]`–`[9]`** | Switch embedded glTF animation clip on your equipped avatar |
-| **`[I]`** | Open Local Inventory & Key-Signed Transfers (`[R]` to transfer/sell selected item) |
-| **Drag & Drop `.glb`** | Equip `.glb` as live avatar or import into prop inventory |
-| **`[G]` / `[Esc]`** | Toggle / Exit 3D Build Mode |
-| **`[B]` / `[N]`** | Toggle Grid Snapping (`1m` / `45°`) / Cycle next prop in inventory |
-| **`[Q]` / `[E]` / `[PgUp]` / `[PgDn]`** | Rotate prop yaw and adjust vertical offset (`[+]`/`[-]` scale) |
-| **`[P]` / `[X]` / `[Del]`** | Place prop / Undo last placed prop / Delete targeted prop you own |
-| **`[F4]`** | Set world spawn point to your current position (in Build Mode) |
-| **`[V]` / `[M]`** | Hold Push-to-Talk spatial voice (`35m`) / Mute incoming voice |
-| **`[T]` or `[/]`** | Open chat input (`[Up]`/`[Down]` command history, `Ctrl+V` paste) |
-| **`[Tab]`** | Open World Portal Directory with live `/status.json` counts (`[F]` pins favorite to #1) |
-| **`[F1]` / `[F2]` / `[F3]`** | Controls Help / Client Settings (`FOV`, sensitivity, fog) / Online Peers list |
-| **`[F12]`** | Save screenshot to `~/.vektorweb-client/exports/` |
-
-### Chat & Admin Commands
-* `/help` — Print available commands and hotkeys in chat
-* `/me <action>` — Broadcast an emote action (`* Nick#pubkey6 <action>`)
-* `/outfit [save <slot>|list|<slot>]` — Save or switch local `(nick, avatar)` presets in `settings.toml`
-* `/clear` — Clear the on-screen chat buffer
-* `/clearmyprops` — Remove all props you placed in the current world
-* `/nick <name>` — Set and persist your display nickname in `settings.toml`
-* `/bookmark [name]` — Save the active world URL to your `[Tab]` World Directory (`worlds.toml`)
-* `/say <message>` — Send local proximity chat (`35m` radius)
-* `/w <nick|pubkey> <message>` — Send a private whisper to an online peer
-* `/portal <url>` / `/back` / `/history` — Hop to a world URL, return to previous world, or list visited worlds
-* `/range` — Toggle the `35m` spatial voice & `/say` proximity ground ring
-* `/setspawn [x y z]` — Set spawn point (saves locally and updates `world.toml` on the relay if admin)
-* `/pubkey` / `/copykey` — Print your 64-char Ed25519 public key or copy it to the clipboard
-* `/mint <buyer_pubkey> <lock|free>` — Sign a `VEKTORWEB_LICENSE_V1` certificate for your active `.glb`
-* `/exportworld` — Export all active world props as paste-ready `[[props]]` TOML to `exports/` & clipboard
-* `/chatlog` — Export recent chat history to `exports/`
-* **Admin Commands** *(requires pubkey in `rules.admins` or `-admin`)*: `/setspawn [x y z]`, `/kick <nick|pubkey>`, `/ban <nick|pubkey>`, `/clearprops`
+| `WASD` + Mouse | Walk / Look (`[Shift]` Sprint, `[Space]` Jump, `[F]` Toggle Walk / Free-Fly) |
+| `[C]` / `[R]` | Toggle 3rd-Person Camera (Scroll wheel zooms) / Return to Spawn |
+| `[I]` | Open Local Inventory (`[U]` Upload `.glb`, `[O]` Open folder, `[R]` Transfer signed item) |
+| `Drag & Drop .glb` | Import `.glb` avatar or prop directly into your client |
+| `[G]` / `[Esc]` | Toggle / Exit Ghost Build Mode (`[B]` Grid snap, `[N]` Next prop) |
+| `[Q/E]` `[Z/X]` `[PgUp/Dn]` | Rotate Yaw / Tilt Pitch & Roll / Adjust Height (`[+/-]` Scale, `[P]` Place) |
+| Look-At Target | `[E]` Interact with prop / Offer trade to peer, `[C]` Clone own prop, `[Del]` Remove |
+| `[V]` / `[M]` / `[U]` | Hold Push-to-Talk (`35m`) / Mute incoming voice / Mute world radio stream |
+| `[Tab]` / `[F12]` | Open World Directory / Save screenshot to `exports/` |
+| `[T]` or `[/]` | Open Chat (`/help`, `/uploadavatar`, `/outfit`, `/exportworld`, `/clearmyprops`, `/nick`, `/bookmark`) |
+| `[F1]` / `[F2]` / `[F3]` | Full Controls Help / Client Settings / Online Peers List |
 
 ---
 
-## World Manifest (`world.toml`) & `.glb` Guidelines
+## Contributing
 
-```toml
-[world]
-title = "VektorWeb Nexus Plaza"
-motd = "Welcome to VektorWeb! Press [F1] for controls or type /help."
-author_pubkey = ""
-relay_url = "wss://vektor.whitenode45.ddns.net/"
-spawn = [0.0, 2.0, 15.0]
-
-[assets]
-environment = "environment.glb"
-environment_sha256 = "" # Optional SHA-256 SRI hash
-script = "world.lua"
-script_sha256 = ""      # Optional SHA-256 SRI hash
-
-[rules]
-placement_mode = "ephemeral" # "forbid" | "ephemeral" | "persistent"
-max_avatar_mb = 15
-max_item_mb = 5
-admins = []
-
-[[portals]]
-name = "Outbound Node"
-url = "vektorweb://example.com/world.toml"
-pos = [0.0, 0.1, -16.0]
-radius = 1.8
-```
-
-### `.glb` Export Tips (Blender / Blockbench)
-* **Format:** Binary glTF 2.0 (`.glb`) with `+Y` up and `1 unit = 1 meter`.
-* **Origins:** Place prop and avatar origins at the base/soles (`Y = 0`); the client automatically aligns avatar bounding boxes to floor height.
-* **Step Height:** Keep walkable stairs and ledges at or below `0.55m` per step for smooth walk collision.
-* **Live Reloading:** Send `SIGUSR1` (`kill -USR1 <pid>`) to `vektorweb-relay` to reload `world.toml`, `bans.txt`, and `blocked_items.txt` without dropping connected players.
-
----
-
-## Protocol Specification
-
-See [`PROTOCOL.md`](./PROTOCOL.md) for the full `vektorweb.v1` wire specification, authentication handshake, binary spatial voice framing, and client-side signed asset transfer flow.
+Bug reports, security reviews, and pull requests are welcome. Please keep external dependencies minimal and preserve the stateless relay / P2P asset split.
